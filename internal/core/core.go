@@ -72,15 +72,16 @@ type Identity struct {
 }
 
 type Status struct {
-	Cloud          string `json:"cloud"`
-	ActiveAlias    string `json:"active_alias"`
-	TargetEmail    string `json:"target_email"`
-	ProjectID      string `json:"project_id"`
-	NumericProject string `json:"numeric_project_id,omitempty"`
-	TokenExpiresIn int64  `json:"token_expires_in_s"`
-	PINCached      bool   `json:"pin_cached"`
-	YubiKeySerial  uint32 `json:"yubikey_serial"`
-	Version        string `json:"version"`
+	Cloud             string `json:"cloud"`
+	ActiveAlias       string `json:"active_alias"`
+	TargetEmail       string `json:"target_email"`
+	ProjectID         string `json:"project_id"`
+	NumericProject    string `json:"numeric_project_id,omitempty"`
+	TokenExpiresIn    int64  `json:"token_expires_in_s"`
+	PINCached         bool   `json:"pin_cached"`
+	PINVerifiedSerial uint32 `json:"pin_verified_serial"`
+	YubiKeySerial     uint32 `json:"yubikey_serial"`
+	Version           string `json:"version"`
 }
 
 type Core struct {
@@ -90,11 +91,12 @@ type Core struct {
 	version string
 	now     func() time.Time
 
-	mintMu sync.Mutex
-	mu     sync.RWMutex
-	pin    []byte
-	clouds map[string]*cloudState
-	serial uint32
+	mintMu            sync.Mutex
+	mu                sync.RWMutex
+	pin               []byte
+	pinVerifiedSerial uint32
+	clouds            map[string]*cloudState
+	serial            uint32
 }
 
 type cloudState struct {
@@ -128,7 +130,7 @@ func (c *Core) Unlock(ctx context.Context, pin string) (int, error) {
 	c.mu.Lock()
 	c.clearPINLocked()
 	c.pin = append([]byte(nil), pin...)
-	c.serial = serial
+	c.pinVerifiedSerial = serial
 	c.mu.Unlock()
 	return retries, nil
 }
@@ -155,6 +157,7 @@ func (c *Core) Use(ctx context.Context, name string) (Token, error) {
 	}
 	defer zero(pin)
 	t, err := c.minter.Mint(ctx, MintRequest{AliasName: name, Alias: alias, PIN: string(pin), Purpose: MintAccess})
+	c.recordPINVerification(t.Serial, err)
 	if err != nil {
 		return Token{}, err
 	}
@@ -220,6 +223,7 @@ func (c *Core) Identity(ctx context.Context, audience string) (Identity, error) 
 	}
 	defer zero(pin)
 	t, err := c.minter.Mint(ctx, MintRequest{AliasName: name, Alias: alias, PIN: string(pin), Purpose: MintIdentity, Audience: audience})
+	c.recordPINVerification(t.Serial, err)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -247,7 +251,7 @@ func (c *Core) Status() Status {
 	return Status{
 		Cloud: alias.Cloud, ActiveAlias: state.active, TargetEmail: alias.Target, ProjectID: alias.ProjectID,
 		NumericProject: alias.NumericProjectID, TokenExpiresIn: expires,
-		PINCached: len(c.pin) != 0, YubiKeySerial: c.serial, Version: c.version,
+		PINCached: len(c.pin) != 0, PINVerifiedSerial: c.pinVerifiedSerial, YubiKeySerial: c.serial, Version: c.version,
 	}
 }
 
@@ -267,6 +271,22 @@ func (c *Core) takePIN() ([]byte, error) {
 func (c *Core) clearPINLocked() {
 	zero(c.pin)
 	c.pin = nil
+	c.pinVerifiedSerial = 0
+}
+
+func (c *Core) recordPINVerification(serial uint32, mintErr error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var pinErr *pivsigner.PINError
+	if errors.As(mintErr, &pinErr) {
+		if pinErr.ClearCachedPIN {
+			c.clearPINLocked()
+		}
+		return
+	}
+	if serial != 0 && len(c.pin) != 0 {
+		c.pinVerifiedSerial = serial
+	}
 }
 
 func (c *Core) clearTokensLocked() {

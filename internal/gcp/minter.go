@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,7 +32,7 @@ type Minter struct {
 	Signer     pivsigner.Signer
 	HTTPClient *http.Client
 	BrokerSA   string
-	KeyID      string
+	KeyIDs     map[uint32]string
 	OAuthURL   string
 	IAMURL     string
 	Now        func() time.Time
@@ -132,11 +133,6 @@ func (m *Minter) MintIdentity(ctx context.Context, aliasName string, alias confi
 
 func (m *Minter) brokerToken(ctx context.Context, aliasName, pin string) ([]byte, uint32, error) {
 	now := m.now()
-	header, _ := json.Marshal(struct {
-		Alg string `json:"alg"`
-		Typ string `json:"typ"`
-		Kid string `json:"kid"`
-	}{"RS256", "JWT", m.KeyID})
 	claims, _ := json.Marshal(struct {
 		Iss   string `json:"iss"`
 		Sub   string `json:"sub"`
@@ -146,11 +142,27 @@ func (m *Minter) brokerToken(ctx context.Context, aliasName, pin string) ([]byte
 		Exp   int64  `json:"exp"`
 	}{m.BrokerSA, m.BrokerSA, defaultOAuthURL, cloudScope, now.Unix(), now.Add(10 * time.Minute).Unix()})
 	enc := base64.RawURLEncoding
-	input := enc.EncodeToString(header) + "." + enc.EncodeToString(claims)
-	digest := sha256.Sum256([]byte(input))
-	sig, serial, err := m.Signer.Sign(ctx, aliasName, pin, digest[:])
+	var input string
+	digestFor := func(serial uint32) ([]byte, error) {
+		keyID, ok := m.KeyIDs[serial]
+		if !ok {
+			return nil, fmt.Errorf("no configured key_id for YubiKey %d", serial)
+		}
+		header, _ := json.Marshal(struct {
+			Alg string `json:"alg"`
+			Typ string `json:"typ"`
+			Kid string `json:"kid"`
+		}{"RS256", "JWT", keyID})
+		input = enc.EncodeToString(header) + "." + enc.EncodeToString(claims)
+		digest := sha256.Sum256([]byte(input))
+		return digest[:], nil
+	}
+	sig, serial, err := m.Signer.Sign(ctx, aliasName, pin, digestFor)
 	if err != nil {
 		return nil, serial, fmt.Errorf("sign broker assertion: %w", err)
+	}
+	if input == "" {
+		return nil, serial, errors.New("signer returned without requesting a serial-bound digest")
 	}
 	assertion := input + "." + enc.EncodeToString(sig)
 	form := url.Values{

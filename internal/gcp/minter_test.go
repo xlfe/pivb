@@ -23,27 +23,38 @@ type recordingSigner struct {
 	digest []byte
 	sig    []byte
 	key    *rsa.PrivateKey
+	serial uint32
+	signs  int
 }
 
 func (s *recordingSigner) VerifyPIN(context.Context, string) (uint32, int, error) {
 	return 42, 3, nil
 }
 
-func (s *recordingSigner) Sign(_ context.Context, alias, pin string, digest []byte) ([]byte, uint32, error) {
+func (s *recordingSigner) Sign(_ context.Context, alias, pin string, digestFor func(uint32) ([]byte, error)) ([]byte, uint32, error) {
 	if alias == "" || pin == "" {
 		return nil, 0, fmt.Errorf("missing signing context")
 	}
+	serial := s.serial
+	if serial == 0 {
+		serial = 42
+	}
+	digest, err := digestFor(serial)
+	if err != nil {
+		return nil, serial, err
+	}
+	s.signs++
 	s.digest = append([]byte(nil), digest...)
 	if s.key != nil {
 		sig, err := rsa.SignPKCS1v15(rand.Reader, s.key, crypto.SHA256, digest)
-		return sig, 42, err
+		return sig, serial, err
 	}
-	return append([]byte(nil), s.sig...), 42, nil
+	return append([]byte(nil), s.sig...), serial, nil
 }
 
 func TestJWSGolden(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	signer := &recordingSigner{sig: []byte{1, 2, 3}}
+	signer := &recordingSigner{sig: []byte{1, 2, 3}, serial: 23456789}
 	var assertion string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -60,12 +71,12 @@ func TestJWSGolden(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	m := &Minter{Signer: signer, BrokerSA: "broker@example.test", KeyID: "kid-1", OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
+	m := &Minter{Signer: signer, BrokerSA: "broker@example.test", KeyIDs: map[uint32]string{12345678: "kid-1", 23456789: "kid-2"}, OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
 	_, err := m.MintAccess(context.Background(), "ro", config.Alias{Target: "ro@example.test", LifetimeS: 3600}, "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
-	header := `{"alg":"RS256","typ":"JWT","kid":"kid-1"}`
+	header := `{"alg":"RS256","typ":"JWT","kid":"kid-2"}`
 	claims := `{"iss":"broker@example.test","sub":"broker@example.test","aud":"https://oauth2.googleapis.com/token","scope":"https://www.googleapis.com/auth/cloud-platform","iat":1700000000,"exp":1700000600}`
 	input := base64.RawURLEncoding.EncodeToString([]byte(header)) + "." + base64.RawURLEncoding.EncodeToString([]byte(claims))
 	wantAssertion := input + "." + base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3})
@@ -118,7 +129,7 @@ func TestMintAccessIntegrationAndBrokerTokenWipe(t *testing.T) {
 	}))
 	defer server.Close()
 	m := &Minter{
-		Signer: signer, BrokerSA: "broker@example.test", KeyID: "key-id",
+		Signer: signer, BrokerSA: "broker@example.test", KeyIDs: map[uint32]string{42: "key-id"},
 		OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now },
 		TokenWiped: func(b []byte) {
 			wipeCount++
@@ -159,7 +170,7 @@ func TestMintIdentityParsesExpiry(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, BrokerSA: "b", KeyID: "k", OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
+	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, BrokerSA: "b", KeyIDs: map[uint32]string{42: "k"}, OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
 	token, err := m.MintIdentity(context.Background(), "ro", config.Alias{Target: "t"}, "https://service.test", "1")
 	if err != nil {
 		t.Fatal(err)
@@ -176,13 +187,33 @@ func TestProviderErrorHasStatusAndBoundedBody(t *testing.T) {
 		fmt.Fprint(w, large)
 	}))
 	defer server.Close()
-	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, BrokerSA: "b", KeyID: "k", OAuthURL: server.URL}
+	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, BrokerSA: "b", KeyIDs: map[uint32]string{42: "k"}, OAuthURL: server.URL}
 	_, err := m.MintAccess(context.Background(), "ro", config.Alias{Target: "t", LifetimeS: 1}, "1")
 	if err == nil || !strings.Contains(err.Error(), "HTTP 400 Bad Request") || !strings.Contains(err.Error(), "truncated") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(err.Error()) > maxErrorBody+1000 {
 		t.Fatalf("provider error was not bounded: %d bytes", len(err.Error()))
+	}
+}
+
+func TestUnknownSignerSerialFailsBeforeSignatureOrProviderCall(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	signer := &recordingSigner{sig: []byte{1}, serial: 99}
+	m := &Minter{
+		Signer: signer, BrokerSA: "broker@example.test", KeyIDs: map[uint32]string{42: "known-key"},
+		OAuthURL: server.URL, IAMURL: server.URL,
+	}
+	_, err := m.MintAccess(context.Background(), "ro", config.Alias{Target: "ro@example.test", LifetimeS: 3600}, "123456")
+	if err == nil || !strings.Contains(err.Error(), "no configured key_id for YubiKey 99") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if signer.signs != 0 || requests != 0 {
+		t.Fatalf("unknown serial performed %d signatures and %d provider requests", signer.signs, requests)
 	}
 }
 

@@ -153,8 +153,9 @@ func serve(configPath, socket string) error {
 	if err := pivsigner.CheckPCSC(); err != nil {
 		return err
 	}
-	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials, Notify: cfg.NotifyCmd, Logger: logger}
-	minter := &gcp.Minter{Signer: signer, BrokerSA: cfg.BrokerSA, KeyID: cfg.KeyID, Logger: logger}
+	keyIDs := cfg.KeyIDsBySerial()
+	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger}
+	minter := &gcp.Minter{Signer: signer, BrokerSA: cfg.BrokerSA, KeyIDs: keyIDs, Logger: logger}
 	agentCore := core.New(cfg, signer, minter, version.Value)
 	api := &agentapi.API{Core: agentCore}
 

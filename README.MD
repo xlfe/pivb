@@ -29,9 +29,11 @@ go build ./cmd/pivb
 ## Configure
 
 Copy [`config.example.toml`](config.example.toml) to
-`~/.config/pivb/config.toml`, then set the enrolled YubiKey serials, broker
-service-account address, uploaded key ID, and aliases. The parser rejects unknown
-keys and names missing required keys at startup.
+`~/.config/pivb/config.toml`, then add one `[keys.<serial>]` table per enrolled
+YubiKey with that key's uploaded `key_id`, and set the broker service-account
+address and aliases. The parser rejects unknown keys, invalid serials, duplicate
+key IDs, and missing required keys at startup. The former top-level
+`yubikey_serials` and `key_id` settings are intentionally unsupported.
 
 `cloud = "gcp"` is optional on aliases and defaults to GCP. It is present as the
 extension seam for future AWS and Azure minters; other cloud values are rejected
@@ -43,6 +45,13 @@ PIN caching has two modes:
 - `session`: retain the verified PIN in daemon RAM until `pivb lock` or restart.
 - `never`: consume the cached PIN on the next mint attempt, requiring `pivb
   unlock` before every access- or ID-token mint.
+
+The serial is read and its matching JWT `kid` is selected inside the same PIV
+signing session, so any configured fleet key can be used without editing config or
+restarting pivb. Set the same PIV PIN on every fleet key for seamless swaps. If a
+swapped key rejects the cached PIN, pivb spends at most one attempt, clears the
+cache, and asks you to run `pivb unlock` with that key inserted. It never spends a
+key's final PIN attempt.
 
 An empty `notify_cmd = []` disables desktop notifications. The default is
 `["notify-send", "pivb"]`; pivb appends the touch or expiry message as the last
@@ -89,6 +98,10 @@ pivb token              # metadata only
 pivb token --print      # explicit debugging escape hatch
 pivb lock               # discard cached PIN, access token, and ID tokens
 ```
+
+`pivb status` is card-free: `pin_verified_serial` identifies the key against which
+the cached PIN was last verified, while `yubikey_serial` identifies the key used by
+the last successful mint. Neither field probes for the currently inserted card.
 
 The metadata token endpoint never auto-mints. If the token is missing or expired,
 it returns HTTP 503 with a remedy; below four minutes it emits one expiry
@@ -145,12 +158,16 @@ for target in readonly-sa deployment-sa; do
 done
 ```
 
-Repeat only key generation, certificate export, and key upload for additional
-YubiKeys. GCP allows up to ten user-managed keys on the broker service account.
+Repeat key generation, certificate export, and key upload for each fleet YubiKey.
+Record every uploaded key's ID under its serial in `[keys.<serial>]`; aliases are
+shared and need no per-key entries. GCP allows up to ten user-managed keys on the
+broker service account.
 
 ## Security and failure behavior
 
 - A PIV connection exists only for selection/PIN verification or one signature.
+- Serial lookup, JWT `kid` selection, cross-key PIN verification, and signing occur
+  in one PIV session. Status requests use only cached memory and never open a card.
 - A confirmed PC/SC sharing violation triggers exactly one
   `gpgconf --kill scdaemon` and one fresh retry. Other errors never trigger it.
 - Signing has a 20-second request deadline; the YubiKey normally bounds an ignored
@@ -176,12 +193,14 @@ Azure module can use an Entra client assertion in slot `83`.
 With the operator and enrolled hardware, verify:
 
 1. `pivb unlock && pivb use ro`, touch, then inspect `pivb status`.
-2. Run `gcloud auth list` and an authorized storage operation with no ADC file.
-3. Exercise the JVM backend with only `GCE_METADATA_HOST` configured.
-4. Switch to `deploy` and confirm only the new identity is served.
-5. Collide a renew with an in-flight GPG operation and observe at most one WARN,
+2. Swap to each other configured fleet key and repeat `pivb use ro` without
+   changing config or restarting; re-unlock only if the fleet PINs differ.
+3. Run `gcloud auth list` and an authorized storage operation with no ADC file.
+4. Exercise the JVM backend with only `GCE_METADATA_HOST` configured.
+5. Switch to `deploy` and confirm only the new identity is served.
+6. Collide a renew with an in-flight GPG operation and observe at most one WARN,
    one scdaemon kill, and one retry.
-6. Ignore a touch; confirm a loud failure within roughly 20 seconds and a successful
+7. Ignore a touch; confirm a loud failure within roughly 20 seconds and a successful
    subsequent renew.
-7. Reboot; confirm the daemon starts and metadata serves a remedial 503 until
+8. Reboot; confirm the daemon starts and metadata serves a remedial 503 until
    unlock plus use.

@@ -3,6 +3,8 @@ package agentapi
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,22 +13,53 @@ import (
 
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
+	"github.com/xlfe/pivb/internal/pivsigner"
 )
 
 type apiSigner struct{}
 
 func (apiSigner) VerifyPIN(context.Context, string) (uint32, int, error) { return 7, 3, nil }
-func (apiSigner) Sign(context.Context, string, string, []byte) ([]byte, uint32, error) {
+func (apiSigner) Sign(context.Context, string, string, func(uint32) ([]byte, error)) ([]byte, uint32, error) {
 	return nil, 0, errors.New("not used")
 }
 
-type apiMinter struct{ now time.Time }
+type apiMinter struct {
+	now time.Time
+	err error
+}
 
 func (m apiMinter) Mint(_ context.Context, request core.MintRequest) (core.MintedCredential, error) {
+	if m.err != nil {
+		return core.MintedCredential{}, m.err
+	}
 	if request.Purpose == core.MintIdentity {
 		return core.MintedCredential{Value: "id-" + request.Audience, ExpiresAt: m.now.Add(time.Hour), Serial: 7}, nil
 	}
 	return core.MintedCredential{Value: "token-" + request.AliasName, ExpiresAt: m.now.Add(time.Hour), Serial: 7}, nil
+}
+
+func TestFleetPINErrorReturnsActionableRemedy(t *testing.T) {
+	cfg := &config.Config{
+		PINCache: "session", DefaultAlias: "ro",
+		Aliases: map[string]config.Alias{"ro": {Cloud: "gcp", Target: "ro@example.test", ProjectID: "p", LifetimeS: 3600}},
+	}
+	pinErr := &pivsigner.PINError{
+		Retries: 2, Err: errors.New("fleet keys have different PINs"),
+		Remedy: "run `pivb unlock` with this key inserted", ClearCachedPIN: true,
+	}
+	c := core.New(cfg, apiSigner{}, apiMinter{err: pinErr}, "test-version")
+	if _, err := c.Unlock(context.Background(), "123456"); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/use", strings.NewReader(`{"alias":"ro"}`))
+	w := httptest.NewRecorder()
+	(&API{Core: c}).Handler(false).ServeHTTP(w, req)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), pinErr.Remedy) {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+	if c.Status().PINCached {
+		t.Fatal("fleet PIN mismatch did not clear cached PIN")
+	}
 }
 
 func TestUnixAPIAndPeerCredentials(t *testing.T) {

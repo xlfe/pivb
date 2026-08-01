@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-piv/piv-go/v2/piv"
@@ -25,8 +26,10 @@ const (
 const sharingViolationPIVGoText = "the smart card cannot be accessed because of other connections outstanding"
 
 type PINError struct {
-	Retries int
-	Err     error
+	Retries        int
+	Err            error
+	Remedy         string
+	ClearCachedPIN bool
 }
 
 func (e *PINError) Error() string {
@@ -40,7 +43,7 @@ func (e *PINError) Unwrap() error { return e.Err }
 
 type Signer interface {
 	VerifyPIN(ctx context.Context, pin string) (serial uint32, retries int, err error)
-	Sign(ctx context.Context, alias, pin string, digest []byte) (signature []byte, serial uint32, err error)
+	Sign(ctx context.Context, alias, pin string, digestFor func(serial uint32) ([]byte, error)) (signature []byte, serial uint32, err error)
 }
 
 type Hardware struct {
@@ -48,6 +51,9 @@ type Hardware struct {
 	Notify   []string
 	Logger   *slog.Logger
 	Deadline time.Duration
+
+	mu             sync.Mutex
+	verifiedSerial uint32
 }
 
 func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, error) {
@@ -76,10 +82,11 @@ func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, erro
 		}
 		return serial, retries, &PINError{Retries: retries, Err: err}
 	}
+	h.setVerifiedSerial(serial)
 	return serial, retries, nil
 }
 
-func (h *Hardware) Sign(ctx context.Context, alias, pin string, digest []byte) ([]byte, uint32, error) {
+func (h *Hardware) Sign(ctx context.Context, alias, pin string, digestFor func(uint32) ([]byte, error)) ([]byte, uint32, error) {
 	deadline := h.Deadline
 	if deadline == 0 {
 		deadline = 20 * time.Second
@@ -87,7 +94,7 @@ func (h *Hardware) Sign(ctx context.Context, alias, pin string, digest []byte) (
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 
-	sig, serial, err := h.signAttempt(ctx, alias, pin, digest)
+	sig, serial, err := h.signAttempt(ctx, alias, pin, digestFor)
 	if err == nil || !IsSharingViolation(err) {
 		return sig, serial, err
 	}
@@ -95,7 +102,7 @@ func (h *Hardware) Sign(ctx context.Context, alias, pin string, digest []byte) (
 	if killErr := exec.CommandContext(ctx, "gpgconf", "--kill", "scdaemon").Run(); killErr != nil {
 		return nil, 0, fmt.Errorf("sharing violation; kill scdaemon before retry: %w", killErr)
 	}
-	return h.signAttempt(ctx, alias, pin, digest)
+	return h.signAttempt(ctx, alias, pin, digestFor)
 }
 
 type signResult struct {
@@ -104,7 +111,7 @@ type signResult struct {
 	err    error
 }
 
-func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digest []byte) ([]byte, uint32, error) {
+func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digestFor func(uint32) ([]byte, error)) ([]byte, uint32, error) {
 	result := make(chan signResult, 1)
 	go func() {
 		yk, serial, err := h.openSelected()
@@ -113,6 +120,15 @@ func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digest []
 			return
 		}
 		defer yk.Close()
+		digest, err := digestFor(serial)
+		if err != nil {
+			result <- signResult{err: fmt.Errorf("build signing digest for YubiKey %d: %w", serial, err)}
+			return
+		}
+		if err := h.verifyCachedPIN(yk, serial, pin); err != nil {
+			result <- signResult{err: err}
+			return
+		}
 		cert, err := yk.Certificate(piv.SlotSignature)
 		if err != nil {
 			result <- signResult{serial: serial, err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)}
@@ -154,6 +170,49 @@ func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digest []
 	case r := <-result:
 		return r.sig, r.serial, r.err
 	}
+}
+
+func (h *Hardware) verifyCachedPIN(yk *piv.YubiKey, serial uint32, pin string) error {
+	if h.getVerifiedSerial() == serial {
+		return nil
+	}
+	retries, err := yk.Retries()
+	if err != nil {
+		return fmt.Errorf("read PIN retries for swapped YubiKey %d: %w", serial, err)
+	}
+	if retries <= 1 {
+		return &PINError{
+			Retries: retries,
+			Err:     fmt.Errorf("refusing to try the cached PIN on swapped YubiKey %d and spend the final PIN attempt", serial),
+			Remedy:  "run `pivb unlock` with this key inserted after checking or resetting its PIV PIN",
+		}
+	}
+	if err := yk.VerifyPIN(pin); err != nil {
+		if authErr := (piv.AuthErr{}); errors.As(err, &authErr) {
+			retries = authErr.Retries
+		}
+		h.setVerifiedSerial(0)
+		return &PINError{
+			Retries:        retries,
+			Err:            fmt.Errorf("cached PIN was rejected by swapped YubiKey %d; fleet keys may have different PINs: %w", serial, err),
+			Remedy:         "run `pivb unlock` with this key inserted; use the same PIV PIN on every fleet key for seamless swaps",
+			ClearCachedPIN: true,
+		}
+	}
+	h.setVerifiedSerial(serial)
+	return nil
+}
+
+func (h *Hardware) getVerifiedSerial() uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.verifiedSerial
+}
+
+func (h *Hardware) setVerifiedSerial(serial uint32) {
+	h.mu.Lock()
+	h.verifiedSerial = serial
+	h.mu.Unlock()
 }
 
 func (h *Hardware) openSelected() (*piv.YubiKey, uint32, error) {

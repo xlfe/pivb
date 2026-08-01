@@ -125,13 +125,21 @@ func (a *API) identity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) writeCoreError(w http.ResponseWriter, err error) {
+	var unknownAlias *core.UnknownAliasError
+	var pinErr *pivsigner.PINError
 	switch {
 	case errors.Is(err, core.ErrLocked):
 		writeError(w, http.StatusConflict, err.Error(), "run `pivb unlock` before minting")
 	case errors.Is(err, core.ErrAudience):
 		writeError(w, http.StatusBadRequest, err.Error(), "add a non-empty audience query parameter")
-	case func() bool { var e *core.UnknownAliasError; return errors.As(err, &e) }():
+	case errors.As(err, &unknownAlias):
 		writeError(w, http.StatusBadRequest, err.Error(), "choose an alias defined in the pivb config")
+	case errors.As(err, &pinErr):
+		remedy := pinErr.Remedy
+		if remedy == "" {
+			remedy = "run `pivb unlock` with the inserted YubiKey and retry"
+		}
+		writeError(w, http.StatusConflict, err.Error(), remedy)
 	default:
 		writeError(w, http.StatusBadGateway, err.Error(), "check the daemon log, touch the YubiKey when prompted, then retry")
 	}

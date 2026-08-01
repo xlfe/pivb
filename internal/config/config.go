@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -17,16 +18,19 @@ const (
 )
 
 type Config struct {
-	YubiKeySerials       []uint32         `toml:"yubikey_serials"`
+	Keys                 map[string]Key   `toml:"keys"`
 	PIVSlot              string           `toml:"piv_slot"`
 	BrokerSA             string           `toml:"broker_sa"`
-	KeyID                string           `toml:"key_id"`
 	PINCache             string           `toml:"pin_cache"`
 	NotifyCmd            []string         `toml:"notify_cmd"`
 	ListenMetadata       string           `toml:"listen_metadata"`
 	DefaultAlias         string           `toml:"default_alias"`
 	RemoteAllowedAliases []string         `toml:"remote_allowed_aliases"`
 	Aliases              map[string]Alias `toml:"aliases"`
+}
+
+type Key struct {
+	KeyID string `toml:"key_id"`
 }
 
 type Alias struct {
@@ -60,10 +64,18 @@ func Load(path string) (*Config, error) {
 	}
 	if undecoded := md.Undecoded(); len(undecoded) != 0 {
 		keys := make([]string, 0, len(undecoded))
+		legacy := false
 		for _, key := range undecoded {
-			keys = append(keys, key.String())
+			name := key.String()
+			keys = append(keys, name)
+			if name == "yubikey_serials" || name == "key_id" {
+				legacy = true
+			}
 		}
 		sort.Strings(keys)
+		if legacy {
+			return nil, fmt.Errorf("legacy config key(s) %s are no longer supported; configure each key as [keys.<serial>] with key_id", strings.Join(keys, ", "))
+		}
 		return nil, fmt.Errorf("unknown config key(s): %s", strings.Join(keys, ", "))
 	}
 	cfg.applyDefaults()
@@ -104,14 +116,38 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("config key %q is required", key))
 		}
 	}
-	if len(c.YubiKeySerials) == 0 {
-		errs = append(errs, errors.New("config key \"yubikey_serials\" must contain at least one serial"))
+	if len(c.Keys) == 0 {
+		errs = append(errs, errors.New("config key \"keys\" must contain at least one [keys.<serial>] table"))
+	}
+	serialNames := make(map[uint32]string, len(c.Keys))
+	keyIDs := make(map[string]string, len(c.Keys))
+	for serialName, key := range c.Keys {
+		serialValue, err := strconv.ParseUint(serialName, 10, 32)
+		if err != nil || serialValue == 0 {
+			errs = append(errs, fmt.Errorf("config key %q must use a positive integer YubiKey serial", "keys."+serialName))
+			continue
+		}
+		serial := uint32(serialValue)
+		if previous, exists := serialNames[serial]; exists {
+			errs = append(errs, fmt.Errorf("config keys %q and %q name the same YubiKey serial", "keys."+previous, "keys."+serialName))
+		} else {
+			serialNames[serial] = serialName
+		}
+		keyID := strings.TrimSpace(key.KeyID)
+		if keyID == "" {
+			errs = append(errs, fmt.Errorf("config key %q is required", "keys."+serialName+".key_id"))
+			continue
+		}
+		if previous, exists := keyIDs[keyID]; exists {
+			errs = append(errs, fmt.Errorf("config keys %q and %q contain duplicate key_id %q", "keys."+previous+".key_id", "keys."+serialName+".key_id", keyID))
+		} else {
+			keyIDs[keyID] = serialName
+		}
 	}
 	if c.PIVSlot != "9c" {
 		errs = append(errs, fmt.Errorf("config key \"piv_slot\" must be \"9c\", got %q", c.PIVSlot))
 	}
 	require("broker_sa", c.BrokerSA)
-	require("key_id", c.KeyID)
 	if c.PINCache != "session" && c.PINCache != "never" {
 		errs = append(errs, fmt.Errorf("config key \"pin_cache\" must be \"session\" or \"never\", got %q", c.PINCache))
 	}
@@ -145,4 +181,25 @@ func (c *Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (c *Config) KeyIDsBySerial() map[uint32]string {
+	keys := make(map[uint32]string, len(c.Keys))
+	for serialName, key := range c.Keys {
+		serial, err := strconv.ParseUint(serialName, 10, 32)
+		if err == nil && serial != 0 {
+			keys[uint32(serial)] = strings.TrimSpace(key.KeyID)
+		}
+	}
+	return keys
+}
+
+func (c *Config) YubiKeySerials() []uint32 {
+	keys := c.KeyIDsBySerial()
+	serials := make([]uint32, 0, len(keys))
+	for serial := range keys {
+		serials = append(serials, serial)
+	}
+	sort.Slice(serials, func(i, j int) bool { return serials[i] < serials[j] })
+	return serials
 }
