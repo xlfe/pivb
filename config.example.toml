@@ -1,14 +1,15 @@
 piv_slot = "9c"
-broker_sa = "pivb-broker@example-project-id.iam.gserviceaccount.com"
 pin_cache = "session"
 notify_cmd = ["notify-send", "pivb"]
 listen_metadata = "127.0.0.1:8642"
 default_alias = "ro"
 
-[keys.12345678] # replace with an enrolled key's serial and uploaded key ID
+[keys.12345678] # replace with an enrolled serial, dedicated broker SA, and uploaded key ID
+broker_sa = "pivb-broker-12345678@example-project-id.iam.gserviceaccount.com"
 key_id = "replace-with-first-uploaded-key-id"
 
 [keys.23456789]
+broker_sa = "pivb-broker-23456789@example-project-id.iam.gserviceaccount.com"
 key_id = "replace-with-second-uploaded-key-id"
 
 [aliases.ro]

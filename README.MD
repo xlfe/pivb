@@ -30,10 +30,11 @@ go build ./cmd/pivb
 
 Copy [`config.example.toml`](config.example.toml) to
 `~/.config/pivb/config.toml`, then add one `[keys.<serial>]` table per enrolled
-YubiKey with that key's uploaded `key_id`, and set the broker service-account
-address and aliases. The parser rejects unknown keys, invalid serials, duplicate
-key IDs, and missing required keys at startup. The former top-level
-`yubikey_serials` and `key_id` settings are intentionally unsupported.
+YubiKey with that key's dedicated `broker_sa` and uploaded `key_id`, then set the
+aliases. The parser rejects unknown keys, invalid serials, duplicate key IDs,
+duplicate broker service accounts, and missing required keys at startup. The
+former top-level `yubikey_serials`, `key_id`, and `broker_sa` settings are
+intentionally unsupported.
 
 `cloud = "gcp"` is optional on aliases and defaults to GCP. It is present as the
 extension seam for future AWS and Azure minters; other cloud values are rejected
@@ -46,12 +47,14 @@ PIN caching has two modes:
 - `never`: consume the cached PIN on the next mint attempt, requiring `pivb
   unlock` before every access- or ID-token mint.
 
-The serial is read and its matching JWT `kid` is selected inside the same PIV
-signing session, so any configured fleet key can be used without editing config or
-restarting pivb. Set the same PIV PIN on every fleet key for seamless swaps. If a
-swapped key rejects the cached PIN, pivb spends at most one attempt, clears the
-cache, and asks you to run `pivb unlock` with that key inserted. It never spends a
-key's final PIN attempt.
+The serial is read and its matching JWT `kid`, issuer, and subject are selected
+inside the same PIV signing session, so any configured fleet key can be used
+without editing config or restarting pivb. The dedicated broker identity makes
+each physical key attributable in IAM Credentials and downstream delegation logs.
+Set the same PIV PIN on every fleet key for seamless swaps. If a swapped key
+rejects the cached PIN, pivb spends at most one attempt, clears the cache, and asks
+you to run `pivb unlock` with that key inserted. It never spends a key's final PIN
+attempt.
 
 An empty `notify_cmd = []` disables desktop notifications. The default is
 `["notify-send", "pivb"]`; pivb appends the touch or expiry message as the last
@@ -125,7 +128,7 @@ machine containing the YubiKey.
 
 First verify that `iam.disableServiceAccountKeyUpload` is not enforced and that any
 `iam.serviceAccountKeyExpiryHours` policy permits the certificate lifetime. The
-broker service account must receive no project roles; its only grants are
+broker service accounts must receive no project roles; their only grants are
 `roles/iam.serviceAccountTokenCreator` on explicit target service accounts.
 
 For each card (the example uses placeholder serial `12345678`):
@@ -140,34 +143,43 @@ ykman piv certificates generate --subject "CN=pivb-yk-12345678" --valid-days 730
 ykman piv certificates export 9c cert-12345678.pem
 ```
 
-Create and constrain the broker:
+Create and constrain one dedicated broker for each card. For serial `12345678`:
 
 ```console
-gcloud iam service-accounts create pivb-broker \
-  --project=example-project-id \
-  --display-name="pivb YubiKey broker"
+serial=12345678
+broker_name="pivb-broker-$serial"
 
-gcloud iam service-accounts keys upload cert-12345678.pem \
-  --iam-account=pivb-broker@example-project-id.iam.gserviceaccount.com
+gcloud iam service-accounts create "$broker_name" \
+  --project=example-project-id \
+  --display-name="pivb YubiKey broker $serial"
+
+gcloud iam service-accounts keys upload "cert-$serial.pem" \
+  --iam-account="$broker_name@example-project-id.iam.gserviceaccount.com"
 
 for target in readonly-sa deployment-sa; do
   gcloud iam service-accounts add-iam-policy-binding \
     "$target@example-project-id.iam.gserviceaccount.com" \
-    --member="serviceAccount:pivb-broker@example-project-id.iam.gserviceaccount.com" \
+    --member="serviceAccount:$broker_name@example-project-id.iam.gserviceaccount.com" \
     --role="roles/iam.serviceAccountTokenCreator"
 done
 ```
 
-Repeat key generation, certificate export, and key upload for each fleet YubiKey.
-Record every uploaded key's ID under its serial in `[keys.<serial>]`; aliases are
-shared and need no per-key entries. GCP allows up to ten user-managed keys on the
-broker service account.
+Repeat the full key and dedicated-broker setup for each fleet YubiKey. Record each
+broker address and uploaded key ID under its serial in `[keys.<serial>]`; aliases
+are shared and need no per-key entries. Each broker has only its own uploaded key,
+so losing a card can be handled by disabling that broker service account.
+
+With IAM Credentials `DATA_READ` audit logs enabled, mint once with each card and
+confirm that the `GenerateAccessToken` entries name different dedicated broker
+principals. Downstream delegation records should likewise name the broker for the
+card that minted the credential.
 
 ## Security and failure behavior
 
 - A PIV connection exists only for selection/PIN verification or one signature.
-- Serial lookup, JWT `kid` selection, cross-key PIN verification, and signing occur
-  in one PIV session. Status requests use only cached memory and never open a card.
+- Serial lookup, JWT `kid`/issuer/subject selection, cross-key PIN verification,
+  and signing occur in one PIV session. Status requests use only cached memory and
+  never open a card.
 - A confirmed PC/SC sharing violation triggers exactly one
   `gpgconf --kill scdaemon` and one fresh retry. Other errors never trigger it.
 - Signing has a 20-second request deadline; the YubiKey normally bounds an ignored

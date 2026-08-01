@@ -71,17 +71,28 @@ func TestJWSGolden(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	m := &Minter{Signer: signer, BrokerSA: "broker@example.test", KeyIDs: map[uint32]string{12345678: "kid-1", 23456789: "kid-2"}, OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
+	m := &Minter{
+		Signer: signer,
+		Keys: map[uint32]config.Key{
+			12345678: {BrokerSA: "broker-1@example.test", KeyID: "kid-1"},
+			23456789: {BrokerSA: "broker-2@example.test", KeyID: "kid-2"},
+		},
+		OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now },
+	}
 	_, err := m.MintAccess(context.Background(), "ro", config.Alias{Target: "ro@example.test", LifetimeS: 3600}, "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
 	header := `{"alg":"RS256","typ":"JWT","kid":"kid-2"}`
-	claims := `{"iss":"broker@example.test","sub":"broker@example.test","aud":"https://oauth2.googleapis.com/token","scope":"https://www.googleapis.com/auth/cloud-platform","iat":1700000000,"exp":1700000600}`
+	claims := `{"iss":"broker-2@example.test","sub":"broker-2@example.test","aud":"https://oauth2.googleapis.com/token","scope":"https://www.googleapis.com/auth/cloud-platform","iat":1700000000,"exp":1700000600}`
 	input := base64.RawURLEncoding.EncodeToString([]byte(header)) + "." + base64.RawURLEncoding.EncodeToString([]byte(claims))
 	wantAssertion := input + "." + base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3})
 	if assertion != wantAssertion {
 		t.Fatalf("assertion mismatch\n got: %s\nwant: %s", assertion, wantAssertion)
+	}
+	gotHeader, gotClaims := decodeAssertion(t, assertion)
+	if gotHeader["kid"] != "kid-2" || gotClaims["iss"] != "broker-2@example.test" || gotClaims["sub"] != "broker-2@example.test" {
+		t.Fatalf("serial-bound assertion header=%v claims=%v", gotHeader, gotClaims)
 	}
 	wantDigest := sha256.Sum256([]byte(input))
 	if string(signer.digest) != string(wantDigest[:]) {
@@ -129,7 +140,7 @@ func TestMintAccessIntegrationAndBrokerTokenWipe(t *testing.T) {
 	}))
 	defer server.Close()
 	m := &Minter{
-		Signer: signer, BrokerSA: "broker@example.test", KeyIDs: map[uint32]string{42: "key-id"},
+		Signer: signer, Keys: map[uint32]config.Key{42: {BrokerSA: "broker@example.test", KeyID: "key-id"}},
 		OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now },
 		TokenWiped: func(b []byte) {
 			wipeCount++
@@ -170,7 +181,7 @@ func TestMintIdentityParsesExpiry(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, BrokerSA: "b", KeyIDs: map[uint32]string{42: "k"}, OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
+	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, Keys: map[uint32]config.Key{42: {BrokerSA: "b", KeyID: "k"}}, OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now }}
 	token, err := m.MintIdentity(context.Background(), "ro", config.Alias{Target: "t"}, "https://service.test", "1")
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +198,7 @@ func TestProviderErrorHasStatusAndBoundedBody(t *testing.T) {
 		fmt.Fprint(w, large)
 	}))
 	defer server.Close()
-	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, BrokerSA: "b", KeyIDs: map[uint32]string{42: "k"}, OAuthURL: server.URL}
+	m := &Minter{Signer: &recordingSigner{sig: []byte{1}}, Keys: map[uint32]config.Key{42: {BrokerSA: "b", KeyID: "k"}}, OAuthURL: server.URL}
 	_, err := m.MintAccess(context.Background(), "ro", config.Alias{Target: "t", LifetimeS: 1}, "1")
 	if err == nil || !strings.Contains(err.Error(), "HTTP 400 Bad Request") || !strings.Contains(err.Error(), "truncated") {
 		t.Fatalf("unexpected error: %v", err)
@@ -205,11 +216,11 @@ func TestUnknownSignerSerialFailsBeforeSignatureOrProviderCall(t *testing.T) {
 	defer server.Close()
 	signer := &recordingSigner{sig: []byte{1}, serial: 99}
 	m := &Minter{
-		Signer: signer, BrokerSA: "broker@example.test", KeyIDs: map[uint32]string{42: "known-key"},
+		Signer: signer, Keys: map[uint32]config.Key{42: {BrokerSA: "broker@example.test", KeyID: "known-key"}},
 		OAuthURL: server.URL, IAMURL: server.URL,
 	}
 	_, err := m.MintAccess(context.Background(), "ro", config.Alias{Target: "ro@example.test", LifetimeS: 3600}, "123456")
-	if err == nil || !strings.Contains(err.Error(), "no configured key_id for YubiKey 99") {
+	if err == nil || !strings.Contains(err.Error(), "no configured key material for YubiKey 99") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if signer.signs != 0 || requests != 0 {
@@ -226,17 +237,8 @@ func verifyAssertion(t *testing.T, form url.Values, public *rsa.PublicKey, now t
 	if len(parts) != 3 {
 		t.Fatalf("assertion has %d parts", len(parts))
 	}
-	headerBytes, _ := base64.RawURLEncoding.DecodeString(parts[0])
-	claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-	var header map[string]any
-	var claims map[string]any
-	if err := json.Unmarshal(headerBytes, &header); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
-		t.Fatal(err)
-	}
-	if header["alg"] != "RS256" || header["kid"] != "key-id" || claims["iss"] != "broker@example.test" {
+	header, claims := decodeAssertion(t, form.Get("assertion"))
+	if header["alg"] != "RS256" || header["kid"] != "key-id" || claims["iss"] != "broker@example.test" || claims["sub"] != "broker@example.test" {
 		t.Errorf("header=%v claims=%v", header, claims)
 	}
 	if int64(claims["iat"].(float64)) != now.Unix() || int64(claims["exp"].(float64)) != now.Add(10*time.Minute).Unix() {
@@ -250,4 +252,29 @@ func verifyAssertion(t *testing.T, form url.Values, public *rsa.PublicKey, now t
 	if err := rsa.VerifyPKCS1v15(public, crypto.SHA256, digest[:], sig); err != nil {
 		t.Fatalf("verify assertion: %v", err)
 	}
+}
+
+func decodeAssertion(t *testing.T, assertion string) (map[string]any, map[string]any) {
+	t.Helper()
+	parts := strings.Split(assertion, ".")
+	if len(parts) != 3 {
+		t.Fatalf("assertion has %d parts", len(parts))
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header map[string]any
+	var claims map[string]any
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		t.Fatal(err)
+	}
+	return header, claims
 }

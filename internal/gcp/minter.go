@@ -31,8 +31,7 @@ const (
 type Minter struct {
 	Signer     pivsigner.Signer
 	HTTPClient *http.Client
-	BrokerSA   string
-	KeyIDs     map[uint32]string
+	Keys       map[uint32]config.Key
 	OAuthURL   string
 	IAMURL     string
 	Now        func() time.Time
@@ -133,26 +132,26 @@ func (m *Minter) MintIdentity(ctx context.Context, aliasName string, alias confi
 
 func (m *Minter) brokerToken(ctx context.Context, aliasName, pin string) ([]byte, uint32, error) {
 	now := m.now()
-	claims, _ := json.Marshal(struct {
-		Iss   string `json:"iss"`
-		Sub   string `json:"sub"`
-		Aud   string `json:"aud"`
-		Scope string `json:"scope"`
-		Iat   int64  `json:"iat"`
-		Exp   int64  `json:"exp"`
-	}{m.BrokerSA, m.BrokerSA, defaultOAuthURL, cloudScope, now.Unix(), now.Add(10 * time.Minute).Unix()})
 	enc := base64.RawURLEncoding
 	var input string
 	digestFor := func(serial uint32) ([]byte, error) {
-		keyID, ok := m.KeyIDs[serial]
+		key, ok := m.Keys[serial]
 		if !ok {
-			return nil, fmt.Errorf("no configured key_id for YubiKey %d", serial)
+			return nil, fmt.Errorf("no configured key material for YubiKey %d", serial)
 		}
 		header, _ := json.Marshal(struct {
 			Alg string `json:"alg"`
 			Typ string `json:"typ"`
 			Kid string `json:"kid"`
-		}{"RS256", "JWT", keyID})
+		}{"RS256", "JWT", key.KeyID})
+		claims, _ := json.Marshal(struct {
+			Iss   string `json:"iss"`
+			Sub   string `json:"sub"`
+			Aud   string `json:"aud"`
+			Scope string `json:"scope"`
+			Iat   int64  `json:"iat"`
+			Exp   int64  `json:"exp"`
+		}{key.BrokerSA, key.BrokerSA, defaultOAuthURL, cloudScope, now.Unix(), now.Add(10 * time.Minute).Unix()})
 		input = enc.EncodeToString(header) + "." + enc.EncodeToString(claims)
 		digest := sha256.Sum256([]byte(input))
 		return digest[:], nil

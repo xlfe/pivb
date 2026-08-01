@@ -20,7 +20,6 @@ const (
 type Config struct {
 	Keys                 map[string]Key   `toml:"keys"`
 	PIVSlot              string           `toml:"piv_slot"`
-	BrokerSA             string           `toml:"broker_sa"`
 	PINCache             string           `toml:"pin_cache"`
 	NotifyCmd            []string         `toml:"notify_cmd"`
 	ListenMetadata       string           `toml:"listen_metadata"`
@@ -30,7 +29,8 @@ type Config struct {
 }
 
 type Key struct {
-	KeyID string `toml:"key_id"`
+	BrokerSA string `toml:"broker_sa"`
+	KeyID    string `toml:"key_id"`
 }
 
 type Alias struct {
@@ -68,13 +68,13 @@ func Load(path string) (*Config, error) {
 		for _, key := range undecoded {
 			name := key.String()
 			keys = append(keys, name)
-			if name == "yubikey_serials" || name == "key_id" {
+			if name == "yubikey_serials" || name == "key_id" || name == "broker_sa" {
 				legacy = true
 			}
 		}
 		sort.Strings(keys)
 		if legacy {
-			return nil, fmt.Errorf("legacy config key(s) %s are no longer supported; configure each key as [keys.<serial>] with key_id", strings.Join(keys, ", "))
+			return nil, fmt.Errorf("legacy config key(s) %s are no longer supported; configure each key as [keys.<serial>] with broker_sa and key_id", strings.Join(keys, ", "))
 		}
 		return nil, fmt.Errorf("unknown config key(s): %s", strings.Join(keys, ", "))
 	}
@@ -121,6 +121,7 @@ func (c *Config) Validate() error {
 	}
 	serialNames := make(map[uint32]string, len(c.Keys))
 	keyIDs := make(map[string]string, len(c.Keys))
+	brokerSAs := make(map[string]string, len(c.Keys))
 	for serialName, key := range c.Keys {
 		serialValue, err := strconv.ParseUint(serialName, 10, 32)
 		if err != nil || serialValue == 0 {
@@ -132,6 +133,14 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("config keys %q and %q name the same YubiKey serial", "keys."+previous, "keys."+serialName))
 		} else {
 			serialNames[serial] = serialName
+		}
+		brokerSA := strings.TrimSpace(key.BrokerSA)
+		if brokerSA == "" {
+			errs = append(errs, fmt.Errorf("config key %q is required", "keys."+serialName+".broker_sa"))
+		} else if previous, exists := brokerSAs[brokerSA]; exists {
+			errs = append(errs, fmt.Errorf("config keys %q and %q contain duplicate broker_sa %q", "keys."+previous+".broker_sa", "keys."+serialName+".broker_sa", brokerSA))
+		} else {
+			brokerSAs[brokerSA] = serialName
 		}
 		keyID := strings.TrimSpace(key.KeyID)
 		if keyID == "" {
@@ -147,7 +156,6 @@ func (c *Config) Validate() error {
 	if c.PIVSlot != "9c" {
 		errs = append(errs, fmt.Errorf("config key \"piv_slot\" must be \"9c\", got %q", c.PIVSlot))
 	}
-	require("broker_sa", c.BrokerSA)
 	if c.PINCache != "session" && c.PINCache != "never" {
 		errs = append(errs, fmt.Errorf("config key \"pin_cache\" must be \"session\" or \"never\", got %q", c.PINCache))
 	}
@@ -183,19 +191,19 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-func (c *Config) KeyIDsBySerial() map[uint32]string {
-	keys := make(map[uint32]string, len(c.Keys))
+func (c *Config) KeysBySerial() map[uint32]Key {
+	keys := make(map[uint32]Key, len(c.Keys))
 	for serialName, key := range c.Keys {
 		serial, err := strconv.ParseUint(serialName, 10, 32)
 		if err == nil && serial != 0 {
-			keys[uint32(serial)] = strings.TrimSpace(key.KeyID)
+			keys[uint32(serial)] = Key{BrokerSA: strings.TrimSpace(key.BrokerSA), KeyID: strings.TrimSpace(key.KeyID)}
 		}
 	}
 	return keys
 }
 
 func (c *Config) YubiKeySerials() []uint32 {
-	keys := c.KeyIDsBySerial()
+	keys := c.KeysBySerial()
 	serials := make([]uint32, 0, len(keys))
 	for serial := range keys {
 		serials = append(serials, serial)

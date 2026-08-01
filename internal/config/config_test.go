@@ -8,10 +8,10 @@ import (
 )
 
 const validConfig = `
-broker_sa = "broker@example.test"
 default_alias = "ro"
 
 [keys.12345678]
+broker_sa = "broker-1@example.test"
 key_id = "key-1"
 
 [aliases.ro]
@@ -29,7 +29,7 @@ func writeConfig(t *testing.T, body string) string {
 }
 
 func TestLoadFleetKeys(t *testing.T) {
-	body := strings.Replace(validConfig, `[aliases.ro]`, "[keys.23456789]\nkey_id = \"key-2\"\n\n[aliases.ro]", 1)
+	body := strings.Replace(validConfig, `[aliases.ro]`, "[keys.23456789]\nbroker_sa = \"broker-2@example.test\"\nkey_id = \"key-2\"\n\n[aliases.ro]", 1)
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestLoadFleetKeys(t *testing.T) {
 	if len(serials) != 2 || serials[0] != 12345678 || serials[1] != 23456789 {
 		t.Fatalf("serials = %v", serials)
 	}
-	if keys := cfg.KeyIDsBySerial(); keys[12345678] != "key-1" || keys[23456789] != "key-2" {
+	if keys := cfg.KeysBySerial(); keys[12345678] != (Key{BrokerSA: "broker-1@example.test", KeyID: "key-1"}) || keys[23456789] != (Key{BrokerSA: "broker-2@example.test", KeyID: "key-2"}) {
 		t.Fatalf("keys = %v", keys)
 	}
 }
@@ -48,10 +48,12 @@ func TestLoadRejectsInvalidFleetKeys(t *testing.T) {
 		name, keys, want string
 	}{
 		{"empty table", "", `[keys.<serial>]`},
-		{"zero serial", "[keys.0]\nkey_id = \"key-1\"\n", "positive integer"},
-		{"non-integer serial", "[keys.not-a-serial]\nkey_id = \"key-1\"\n", "positive integer"},
-		{"missing key id", "[keys.12345678]\n", "keys.12345678.key_id"},
-		{"duplicate key id", "[keys.12345678]\nkey_id = \"same\"\n[keys.23456789]\nkey_id = \"same\"\n", "duplicate key_id"},
+		{"zero serial", "[keys.0]\nbroker_sa = \"broker@example.test\"\nkey_id = \"key-1\"\n", "positive integer"},
+		{"non-integer serial", "[keys.not-a-serial]\nbroker_sa = \"broker@example.test\"\nkey_id = \"key-1\"\n", "positive integer"},
+		{"missing broker SA", "[keys.12345678]\nkey_id = \"key-1\"\n", "keys.12345678.broker_sa"},
+		{"missing key id", "[keys.12345678]\nbroker_sa = \"broker@example.test\"\n", "keys.12345678.key_id"},
+		{"duplicate key id", "[keys.12345678]\nbroker_sa = \"broker-1@example.test\"\nkey_id = \"same\"\n[keys.23456789]\nbroker_sa = \"broker-2@example.test\"\nkey_id = \"same\"\n", "duplicate key_id"},
+		{"duplicate broker SA", "[keys.12345678]\nbroker_sa = \"same@example.test\"\nkey_id = \"key-1\"\n[keys.23456789]\nbroker_sa = \"same@example.test\"\nkey_id = \"key-2\"\n", "duplicate broker_sa"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,9 +69,9 @@ func TestLoadRejectsInvalidFleetKeys(t *testing.T) {
 }
 
 func TestLoadRejectsLegacyKeyShapeWithMigrationHint(t *testing.T) {
-	for _, legacy := range []string{"yubikey_serials = [12345678]", `key_id = "key-1"`} {
+	for _, legacy := range []string{"yubikey_serials = [12345678]", `key_id = "key-1"`, `broker_sa = "broker@example.test"`} {
 		t.Run(strings.Fields(legacy)[0], func(t *testing.T) {
-			body := strings.Replace(validConfig, "[keys.12345678]\nkey_id = \"key-1\"", legacy, 1)
+			body := strings.Replace(validConfig, "[keys.12345678]\nbroker_sa = \"broker-1@example.test\"\nkey_id = \"key-1\"", legacy, 1)
 			_, err := Load(writeConfig(t, body))
 			if err == nil || !strings.Contains(err.Error(), strings.Fields(legacy)[0]) || !strings.Contains(err.Error(), "[keys.<serial>]") {
 				t.Fatalf("unexpected error: %v", err)
@@ -127,9 +129,9 @@ func TestLoadRejectsUnknownKey(t *testing.T) {
 }
 
 func TestLoadNamesMissingRequiredKey(t *testing.T) {
-	body := strings.Replace(validConfig, `broker_sa = "broker@example.test"`, "", 1)
+	body := strings.Replace(validConfig, `broker_sa = "broker-1@example.test"`, "", 1)
 	_, err := Load(writeConfig(t, body))
-	if err == nil || !strings.Contains(err.Error(), `config key "broker_sa" is required`) {
+	if err == nil || !strings.Contains(err.Error(), `config key "keys.12345678.broker_sa" is required`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
