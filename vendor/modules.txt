@@ -1,0 +1,20 @@
+# github.com/BurntSushi/toml v1.5.0
+## explicit; go 1.18
+github.com/BurntSushi/toml
+github.com/BurntSushi/toml/internal
+# github.com/go-piv/piv-go/v2 v2.6.0
+## explicit; go 1.25.0
+github.com/go-piv/piv-go/v2/piv
+github.com/go-piv/piv-go/v2/third_party/rsa
+# golang.org/x/crypto v0.50.0
+## explicit; go 1.25.0
+golang.org/x/crypto/cryptobyte
+golang.org/x/crypto/cryptobyte/asn1
+# golang.org/x/sys v0.43.0
+## explicit; go 1.25.0
+golang.org/x/sys/plan9
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+# golang.org/x/term v0.42.0
+## explicit; go 1.25.0
+golang.org/x/term

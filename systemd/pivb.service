@@ -1,0 +1,13 @@
+[Unit]
+Description=YubiKey PIV to GCP service-account broker
+Documentation=https://github.com/xlfe/pivb
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@pivb@ serve
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

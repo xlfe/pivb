@@ -1,0 +1,234 @@
+package pivsigner
+
+import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/go-piv/piv-go/v2/piv"
+)
+
+const sharingViolationCode = "0x8010000b"
+
+// piv-go v2.6 maps SCARD_E_SHARING_VIOLATION to this text and does not expose
+// the return code through its public error API.
+const sharingViolationPIVGoText = "the smart card cannot be accessed because of other connections outstanding"
+
+type PINError struct {
+	Retries int
+	Err     error
+}
+
+func (e *PINError) Error() string {
+	if e.Retries >= 0 {
+		return fmt.Sprintf("PIN verification failed (%d retries remaining): %v", e.Retries, e.Err)
+	}
+	return "PIN verification failed: " + e.Err.Error()
+}
+
+func (e *PINError) Unwrap() error { return e.Err }
+
+type Signer interface {
+	VerifyPIN(ctx context.Context, pin string) (serial uint32, retries int, err error)
+	Sign(ctx context.Context, alias, pin string, digest []byte) (signature []byte, serial uint32, err error)
+}
+
+type Hardware struct {
+	Serials  []uint32
+	Notify   []string
+	Logger   *slog.Logger
+	Deadline time.Duration
+}
+
+func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, error) {
+	yk, serial, err := h.openSelected()
+	if err != nil {
+		return 0, -1, err
+	}
+	defer yk.Close()
+
+	retries, err := yk.Retries()
+	if err != nil {
+		return serial, -1, fmt.Errorf("read PIN retries for YubiKey %d: %w", serial, err)
+	}
+	if retries <= 1 {
+		return serial, retries, &PINError{Retries: retries, Err: errors.New("refusing to spend the final PIN attempt")}
+	}
+	select {
+	case <-ctx.Done():
+		return serial, retries, ctx.Err()
+	default:
+	}
+	if err := yk.VerifyPIN(pin); err != nil {
+		var authErr piv.AuthErr
+		if errors.As(err, &authErr) {
+			return serial, authErr.Retries, &PINError{Retries: authErr.Retries, Err: err}
+		}
+		return serial, retries, &PINError{Retries: retries, Err: err}
+	}
+	return serial, retries, nil
+}
+
+func (h *Hardware) Sign(ctx context.Context, alias, pin string, digest []byte) ([]byte, uint32, error) {
+	deadline := h.Deadline
+	if deadline == 0 {
+		deadline = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	sig, serial, err := h.signAttempt(ctx, alias, pin, digest)
+	if err == nil || !IsSharingViolation(err) {
+		return sig, serial, err
+	}
+	h.logger().Warn("PIV session hit confirmed sharing violation; handing card off from scdaemon and retrying once", "error", err)
+	if killErr := exec.CommandContext(ctx, "gpgconf", "--kill", "scdaemon").Run(); killErr != nil {
+		return nil, 0, fmt.Errorf("sharing violation; kill scdaemon before retry: %w", killErr)
+	}
+	return h.signAttempt(ctx, alias, pin, digest)
+}
+
+type signResult struct {
+	sig    []byte
+	serial uint32
+	err    error
+}
+
+func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digest []byte) ([]byte, uint32, error) {
+	result := make(chan signResult, 1)
+	go func() {
+		yk, serial, err := h.openSelected()
+		if err != nil {
+			result <- signResult{err: err}
+			return
+		}
+		defer yk.Close()
+		cert, err := yk.Certificate(piv.SlotSignature)
+		if err != nil {
+			result <- signResult{serial: serial, err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)}
+			return
+		}
+		public, ok := cert.PublicKey.(*rsa.PublicKey)
+		if !ok || public.N.BitLen() != 2048 {
+			result <- signResult{serial: serial, err: fmt.Errorf("PIV slot 9c on YubiKey %d must contain an RSA-2048 certificate", serial)}
+			return
+		}
+		key, err := yk.PrivateKey(piv.SlotSignature, cert.PublicKey, piv.KeyAuth{PIN: pin})
+		if err != nil {
+			result <- signResult{serial: serial, err: fmt.Errorf("open PIV private key on YubiKey %d: %w", serial, err)}
+			return
+		}
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			result <- signResult{serial: serial, err: errors.New("PIV private key does not implement crypto.Signer")}
+			return
+		}
+		h.notify("Touch YubiKey to mint " + alias)
+		sig, err := signer.Sign(rand.Reader, digest, crypto.SHA256)
+		if err != nil {
+			err = fmt.Errorf("sign with PIV slot 9c on YubiKey %d: %w", serial, err)
+		}
+		result <- signResult{sig: sig, serial: serial, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, 0, fmt.Errorf("PIV signing deadline: %w", ctx.Err())
+	case r := <-result:
+		return r.sig, r.serial, r.err
+	}
+}
+
+func (h *Hardware) openSelected() (*piv.YubiKey, uint32, error) {
+	cards, err := piv.Cards()
+	if err != nil {
+		return nil, 0, fmt.Errorf("enumerate smart cards: %w", err)
+	}
+	wanted := make(map[uint32]struct{}, len(h.Serials))
+	for _, serial := range h.Serials {
+		wanted[serial] = struct{}{}
+	}
+	var selected *piv.YubiKey
+	var selectedSerial uint32
+	for _, card := range cards {
+		yk, err := piv.Open(card)
+		if err != nil {
+			if selected != nil {
+				selected.Close()
+			}
+			return nil, 0, fmt.Errorf("open smart card %q: %w", card, err)
+		}
+		serial, err := yk.Serial()
+		if err != nil {
+			yk.Close()
+			if selected != nil {
+				selected.Close()
+			}
+			return nil, 0, fmt.Errorf("read serial for smart card %q: %w", card, err)
+		}
+		if _, ok := wanted[serial]; !ok {
+			yk.Close()
+			continue
+		}
+		if selected != nil {
+			yk.Close()
+			selected.Close()
+			return nil, 0, fmt.Errorf("multiple configured YubiKeys are present (%d and %d); leave exactly one inserted", selectedSerial, serial)
+		}
+		selected, selectedSerial = yk, serial
+	}
+	if selected == nil {
+		return nil, 0, fmt.Errorf("no configured YubiKey present (wanted serials %v)", h.Serials)
+	}
+	return selected, selectedSerial, nil
+}
+
+func IsSharingViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, sharingViolationCode) ||
+		strings.Contains(s, "sharing violation") ||
+		strings.Contains(s, sharingViolationPIVGoText)
+}
+
+func (h *Hardware) notify(message string) {
+	if len(h.Notify) == 0 {
+		return
+	}
+	args := append(append([]string(nil), h.Notify[1:]...), message)
+	cmd := exec.Command(h.Notify[0], args...)
+	if err := cmd.Start(); err != nil {
+		h.logger().Warn("desktop notification failed", "error", err)
+		return
+	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			h.logger().Warn("desktop notification failed", "error", err)
+		}
+	}()
+}
+
+func (h *Hardware) logger() *slog.Logger {
+	if h.Logger != nil {
+		return h.Logger
+	}
+	return slog.Default()
+}
+
+// CheckPCSC verifies that the system smart-card service is reachable. An empty
+// reader list is valid: the user service must start even when no key is inserted.
+func CheckPCSC() error {
+	if _, err := piv.Cards(); err != nil {
+		return fmt.Errorf("pcscd is unavailable: %w", err)
+	}
+	return nil
+}

@@ -1,0 +1,19 @@
+yubikey_serials = [12345678] # replace with each enrolled key's serial
+piv_slot = "9c"
+broker_sa = "pivb-broker@example-project-id.iam.gserviceaccount.com"
+key_id = "replace-with-uploaded-key-id"
+pin_cache = "session"
+notify_cmd = ["notify-send", "pivb"]
+listen_metadata = "127.0.0.1:8642"
+default_alias = "ro"
+
+[aliases.ro]
+cloud = "gcp" # optional in v1; defaults to gcp
+target = "readonly-sa@example-project-id.iam.gserviceaccount.com"
+project_id = "example-project-id"
+lifetime_s = 3600
+
+[aliases.deploy]
+target = "deployment-sa@example-project-id.iam.gserviceaccount.com"
+project_id = "example-project-id"
+lifetime_s = 3600
