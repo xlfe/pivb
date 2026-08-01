@@ -112,6 +112,9 @@ func (f *Frontend) serviceAccount(w http.ResponseWriter, r *http.Request, status
 	case "scopes":
 		f.text(w, cloudScope+"\n")
 	case "token":
+		if scopes, present := r.URL.Query()["scopes"]; present {
+			f.logger().Debug("metadata token scopes query parameter ignored", "requested_scopes", scopes, "served_scope", cloudScope)
+		}
 		token, err := f.Agent.Token(r.Context())
 		if err != nil {
 			f.agentError(w, err)

@@ -1,9 +1,11 @@
 package metadata
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -106,6 +108,27 @@ func TestMetadataTokenExpiryArithmeticAndNotificationWindow(t *testing.T) {
 	}
 	if !f.notifiedExpiry.Equal(agent.token.ExpiresAt) {
 		t.Fatal("expiry notification window was not recorded")
+	}
+}
+
+func TestMetadataTokenLogsIgnoredScopes(t *testing.T) {
+	now := time.Unix(1_900_000_000, 0)
+	agent := &fakeAgent{
+		status: core.Status{ActiveAlias: "ro", TargetEmail: "ro@example.test"},
+		token:  core.Token{AccessToken: "secret", ExpiresAt: now.Add(time.Hour)},
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	handler := (&Frontend{Agent: agent, Logger: logger, Now: func() time.Time { return now }}).Handler()
+	req := httptest.NewRequest(http.MethodGet, prefix+"instance/service-accounts/default/token?scopes=scope-a,scope-b", nil)
+	req.Header.Set("Metadata-Flavor", "Google")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	if got := logs.String(); !strings.Contains(got, "metadata token scopes query parameter ignored") || !strings.Contains(got, "scope-a,scope-b") {
+		t.Fatalf("ignored scopes were not logged at debug: %q", got)
 	}
 }
 

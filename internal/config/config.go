@@ -92,8 +92,8 @@ func (c *Config) applyDefaults() {
 		}
 		if alias.LifetimeS == 0 {
 			alias.LifetimeS = defaultLifetime
-			c.Aliases[name] = alias
 		}
+		c.Aliases[name] = alias
 	}
 }
 

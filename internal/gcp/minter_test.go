@@ -85,7 +85,7 @@ func TestMintAccessIntegrationAndBrokerTokenWipe(t *testing.T) {
 	}
 	now := time.Unix(1_800_000_000, 0).UTC()
 	signer := &recordingSigner{key: private}
-	wiped := false
+	wipeCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/token":
@@ -121,10 +121,10 @@ func TestMintAccessIntegrationAndBrokerTokenWipe(t *testing.T) {
 		Signer: signer, BrokerSA: "broker@example.test", KeyID: "key-id",
 		OAuthURL: server.URL + "/token", IAMURL: server.URL, Now: func() time.Time { return now },
 		TokenWiped: func(b []byte) {
-			wiped = true
+			wipeCount++
 			for i, value := range b {
 				if value != 0 {
-					t.Errorf("broker token byte %d not wiped", i)
+					t.Errorf("broker secret byte %d not wiped", i)
 				}
 			}
 		},
@@ -136,8 +136,8 @@ func TestMintAccessIntegrationAndBrokerTokenWipe(t *testing.T) {
 	if token.Value != "target-access" || !token.ExpiresAt.Equal(now.Add(2*time.Hour)) || token.Serial != 42 {
 		t.Fatalf("token = %#v", token)
 	}
-	if !wiped {
-		t.Fatal("broker token wipe hook was not called")
+	if wipeCount != 2 {
+		t.Fatalf("broker secret wipe hook called %d times, want response body and extracted token", wipeCount)
 	}
 }
 

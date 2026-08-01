@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +59,9 @@ func TestUnixAPIAndPeerCredentials(t *testing.T) {
 	}
 	if mode := mustMode(t, socket); mode.Perm() != 0600 || mode&os.ModeSocket == 0 {
 		t.Fatalf("socket mode = %v", mode)
+	}
+	if err := ServeUnix(context.Background(), socket, api.Handler(true)); err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("second daemon error = %v, want socket already in use", err)
 	}
 	if _, err := client.Token(context.Background()); err == nil {
 		t.Fatal("empty token cache did not fail")

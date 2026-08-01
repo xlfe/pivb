@@ -272,7 +272,9 @@ func (c *Core) clearPINLocked() {
 func (c *Core) clearTokensLocked() {
 	for _, state := range c.clouds {
 		if state.token != nil {
-			// Strings cannot be reliably zeroed in Go; sever all references immediately.
+			// Go strings cannot be reliably zeroed. This includes token fields created
+			// during JSON decoding and PIN strings crossing API/signer boundaries;
+			// sever every retained reference as soon as its lifetime ends.
 			state.token = nil
 		}
 		state.ids = make(map[string]Identity)

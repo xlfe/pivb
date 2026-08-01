@@ -173,8 +173,17 @@ func ServeUnix(ctx context.Context, socket string, handler http.Handler) error {
 		if st.Mode()&os.ModeSocket == 0 {
 			return fmt.Errorf("refusing to replace non-socket path %q", socket)
 		}
-		if err := os.Remove(socket); err != nil {
-			return fmt.Errorf("remove stale agent socket: %w", err)
+		conn, dialErr := net.DialTimeout("unix", socket, 250*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return fmt.Errorf("agent socket %q is already in use", socket)
+		}
+		if errors.Is(dialErr, syscall.ECONNREFUSED) {
+			if err := os.Remove(socket); err != nil {
+				return fmt.Errorf("remove stale agent socket: %w", err)
+			}
+		} else if !errors.Is(dialErr, os.ErrNotExist) {
+			return fmt.Errorf("probe existing agent socket: %w", dialErr)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect agent socket: %w", err)

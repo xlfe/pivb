@@ -46,6 +46,28 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsCloudWithExplicitLifetime(t *testing.T) {
+	body := strings.Replace(validConfig, `project_id = "project-1"`, "project_id = \"project-1\"\nlifetime_s = 7200", 1)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := cfg.Aliases["ro"]
+	if alias.Cloud != "gcp" || alias.LifetimeS != 7200 {
+		t.Fatalf("alias defaults = %#v, want cloud gcp and lifetime 7200", alias)
+	}
+}
+
+func TestExampleConfigLoads(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.example.toml"))
+	if err != nil {
+		t.Fatalf("load config.example.toml: %v", err)
+	}
+	if len(cfg.Aliases) == 0 {
+		t.Fatal("config.example.toml contains no aliases")
+	}
+}
+
 func TestLoadRejectsUnknownKey(t *testing.T) {
 	_, err := Load(writeConfig(t, validConfig+"\ntypo_key = true\n"))
 	if err == nil || !strings.Contains(err.Error(), "unknown config key(s): aliases.ro.typo_key") {

@@ -175,6 +175,7 @@ func (m *Minter) brokerToken(ctx context.Context, aliasName, pin string) ([]byte
 		m.logger().Error("OAuth provider rejected broker assertion", "status", resp.Status, "body", bounded(limited))
 		return nil, serial, fmt.Errorf("exchange broker assertion at %s: HTTP %s: %s", m.oauthURL(), resp.Status, bounded(limited))
 	}
+	defer m.wipe(limited)
 	var token struct {
 		AccessToken string `json:"access_token"`
 	}

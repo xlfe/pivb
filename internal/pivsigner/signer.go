@@ -15,7 +15,10 @@ import (
 	"github.com/go-piv/piv-go/v2/piv"
 )
 
-const sharingViolationCode = "0x8010000b"
+const (
+	sharingViolationCode   = "0x8010000b"
+	signResultDrainTimeout = 2 * time.Second
+)
 
 // piv-go v2.6 maps SCARD_E_SHARING_VIOLATION to this text and does not expose
 // the return code through its public error API.
@@ -140,6 +143,13 @@ func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digest []
 
 	select {
 	case <-ctx.Done():
+		timer := time.NewTimer(signResultDrainTimeout)
+		defer timer.Stop()
+		select {
+		case <-result:
+		case <-timer.C:
+			h.logger().Warn("PIV signing worker did not release the card promptly after cancellation; a follow-up operation may briefly see it as busy")
+		}
 		return nil, 0, fmt.Errorf("PIV signing deadline: %w", ctx.Err())
 	case r := <-result:
 		return r.sig, r.serial, r.err

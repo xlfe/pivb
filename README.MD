@@ -17,7 +17,7 @@ nix develop --command go test ./...
 ```
 
 The flake builds with cgo against `pcsclite` and includes the user unit at
-`share/systemd/user/pivb.service`. Go dependencies are vendored so the build is
+`lib/systemd/user/pivb.service`. Go dependencies are vendored so the build is
 network-independent.
 
 For a local development build inside `nix develop`:
@@ -93,7 +93,9 @@ pivb lock               # discard cached PIN, access token, and ID tokens
 The metadata token endpoint never auto-mints. If the token is missing or expired,
 it returns HTTP 503 with a remedy; below four minutes it emits one expiry
 notification per token window. The identity endpoint mints on demand and caches by
-audience, so the first request for each audience requires a touch.
+audience, so the first request for each audience requires a touch. The token
+endpoint accepts `?scopes=` for client compatibility but ignores it, logs that fact
+at debug level, and returns the cached cloud-platform token.
 
 The agent API listens on `$XDG_RUNTIME_DIR/pivb/agent.sock` with directory mode
 `0700`, socket mode `0600`, and Linux `SO_PEERCRED` UID enforcement. For a forwarded
@@ -152,7 +154,8 @@ YubiKeys. GCP allows up to ten user-managed keys on the broker service account.
 - A confirmed PC/SC sharing violation triggers exactly one
   `gpgconf --kill scdaemon` and one fresh retry. Other errors never trigger it.
 - Signing has a 20-second request deadline; the YubiKey normally bounds an ignored
-  touch at about 15 seconds.
+  touch at about 15 seconds. After cancellation, pivb waits up to two additional
+  seconds for the signing worker to release the card before returning.
 - The broker access-token byte buffer is zeroed immediately after the IAM
   Credentials request returns. Go cannot guarantee erasure of temporary runtime or
   HTTP copies, so process-memory compromise during a mint remains in the threat
