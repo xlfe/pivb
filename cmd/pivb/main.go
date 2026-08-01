@@ -28,6 +28,9 @@ import (
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "pivb:", err)
+		if errors.Is(err, errPinentryCancelled) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
@@ -67,23 +70,15 @@ func run(args []string) error {
 		return metadataCommand(*agentPath, rest)
 	}
 	client := agentapi.NewClient(*agentPath)
+	if cmd == "status" {
+		defer client.HTTP.CloseIdleConnections()
+		return statusCommand(client, rest, os.Stdout)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	switch cmd {
 	case "unlock":
-		if len(rest) != 0 {
-			return errors.New("unlock takes no arguments")
-		}
-		pin, err := readPIN()
-		if err != nil {
-			return err
-		}
-		defer zero(pin)
-		retries, err := client.Unlock(ctx, string(pin))
-		if err != nil {
-			return err
-		}
-		fmt.Printf("unlocked (PIN retries available: %d)\n", retries)
+		return unlockCommand(ctx, client, rest, os.Stdout)
 	case "lock":
 		if len(rest) != 0 {
 			return errors.New("lock takes no arguments")
@@ -110,15 +105,6 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Printf("renewed %s until %s\n", token.TargetEmail, token.ExpiresAt.Local().Format(time.RFC3339))
-	case "status":
-		if len(rest) != 0 {
-			return errors.New("status takes no arguments")
-		}
-		status, err := client.Status(ctx)
-		if err != nil {
-			return err
-		}
-		return printJSON(status)
 	case "token":
 		fs := flag.NewFlagSet("token", flag.ContinueOnError)
 		printToken := fs.Bool("print", false, "print the access token to stdout")
@@ -265,5 +251,5 @@ func zero(b []byte) {
 
 func usage(fs *flag.FlagSet) {
 	fmt.Fprintf(fs.Output(), "usage: pivb [--config path] [--agent socket] <command>\n\n")
-	fmt.Fprintln(fs.Output(), "commands: serve, unlock, lock, use <alias>, renew, status, token [--print], metadata, version")
+	fmt.Fprintln(fs.Output(), "commands: serve, unlock [--if-needed] [--pinentry-program path], lock, use <alias>, renew, status [--watch duration] [--format json|waybar], token [--print], metadata, version")
 }
