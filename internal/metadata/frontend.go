@@ -27,6 +27,12 @@ type Agent interface {
 	Identity(context.Context, string) (core.Identity, error)
 }
 
+type serviceAccountInfo struct {
+	Aliases []string `json:"aliases"`
+	Email   string   `json:"email"`
+	Scopes  []string `json:"scopes"`
+}
+
 type Frontend struct {
 	Agent  Agent
 	Notify []string
@@ -71,6 +77,15 @@ func (f *Frontend) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, prefix)
 	switch {
 	case path == "instance/service-accounts/":
+		if recursiveRequested(r) {
+			info := serviceAccountMetadata(status.TargetEmail)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]serviceAccountInfo{
+				"default":          info,
+				status.TargetEmail: info,
+			})
+			return
+		}
 		f.text(w, "default/\n"+status.TargetEmail+"/\n")
 	case path == "project/project-id":
 		f.text(w, status.ProjectID)
@@ -106,6 +121,11 @@ func (f *Frontend) serviceAccount(w http.ResponseWriter, r *http.Request, status
 	}
 	switch suffix {
 	case "":
+		if recursiveRequested(r) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(serviceAccountMetadata(status.TargetEmail))
+			return
+		}
 		f.text(w, "aliases\nemail\nidentity\nscopes\ntoken\n")
 	case "email":
 		f.text(w, status.TargetEmail)
@@ -150,6 +170,18 @@ func (f *Frontend) serviceAccount(w http.ResponseWriter, r *http.Request, status
 		f.text(w, "default\n")
 	default:
 		f.error(w, http.StatusNotFound, "unknown service-account metadata path", "use aliases, email, identity, scopes, or token")
+	}
+}
+
+func recursiveRequested(r *http.Request) bool {
+	return strings.EqualFold(r.URL.Query().Get("recursive"), "true")
+}
+
+func serviceAccountMetadata(email string) serviceAccountInfo {
+	return serviceAccountInfo{
+		Aliases: []string{"default"},
+		Email:   email,
+		Scopes:  []string{cloudScope},
 	}
 }
 

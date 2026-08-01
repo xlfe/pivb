@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,15 +18,21 @@ import (
 )
 
 type fakeAgent struct {
-	status   core.Status
-	token    core.Token
-	tokenErr error
-	id       core.Identity
+	status     core.Status
+	token      core.Token
+	tokenErr   error
+	id         core.Identity
+	tokenCalls int
+	idCalls    int
 }
 
 func (a *fakeAgent) Status(context.Context) (core.Status, error) { return a.status, nil }
-func (a *fakeAgent) Token(context.Context) (core.Token, error)   { return a.token, a.tokenErr }
+func (a *fakeAgent) Token(context.Context) (core.Token, error) {
+	a.tokenCalls++
+	return a.token, a.tokenErr
+}
 func (a *fakeAgent) Identity(_ context.Context, audience string) (core.Identity, error) {
+	a.idCalls++
 	if audience == "" {
 		return core.Identity{}, errors.New("missing audience")
 	}
@@ -48,7 +55,9 @@ func TestMetadataConformance(t *testing.T) {
 	}{
 		{"root detection", "/", "", "", 200, false},
 		{"accounts", prefix + "instance/service-accounts/", "text/plain", "default/\n" + email + "/\n", 200, true},
+		{"accounts recursive false", prefix + "instance/service-accounts/?recursive=false", "text/plain", "default/\n" + email + "/\n", 200, true},
 		{"default directory", prefix + "instance/service-accounts/default/", "text/plain", "aliases\nemail\nidentity\nscopes\ntoken\n", 200, true},
+		{"default directory recursive false", prefix + "instance/service-accounts/default/?recursive=false", "text/plain", "aliases\nemail\nidentity\nscopes\ntoken\n", 200, true},
 		{"email directory", prefix + "instance/service-accounts/" + email + "/", "text/plain", "aliases\nemail\nidentity\nscopes\ntoken\n", 200, true},
 		{"email", prefix + "instance/service-accounts/default/email", "text/plain", email, 200, true},
 		{"scopes", prefix + "instance/service-accounts/default/scopes", "text/plain", cloudScope + "\n", 200, true},
@@ -76,6 +85,77 @@ func TestMetadataConformance(t *testing.T) {
 				t.Fatalf("Content-Type = %q", w.Header().Get("Content-Type"))
 			}
 		})
+	}
+}
+
+func TestRecursiveServiceAccountMetadata(t *testing.T) {
+	email := "ro@example.test"
+	agent := &fakeAgent{
+		status:   core.Status{Cloud: "gcp", ActiveAlias: "ro", TargetEmail: email, ProjectID: "project-1", PINCached: false},
+		tokenErr: core.ErrNoToken,
+	}
+	handler := (&Frontend{Agent: agent}).Handler()
+	info := map[string]any{
+		"aliases": []any{"default"},
+		"email":   email,
+		"scopes":  []any{cloudScope},
+	}
+	tests := []struct {
+		name, path string
+		want       any
+	}{
+		{
+			name: "accounts recursive",
+			path: prefix + "instance/service-accounts/?recursive=true",
+			want: map[string]any{"default": info, email: info},
+		},
+		{
+			name: "accounts recursive case insensitive",
+			path: prefix + "instance/service-accounts/?recursive=TRUE",
+			want: map[string]any{"default": info, email: info},
+		},
+		{
+			name: "default recursive",
+			path: prefix + "instance/service-accounts/default/?recursive=true",
+			want: info,
+		},
+		{
+			name: "default recursive case insensitive",
+			path: prefix + "instance/service-accounts/default/?recursive=TRUE",
+			want: info,
+		},
+		{
+			name: "email recursive",
+			path: prefix + "instance/service-accounts/" + email + "/?recursive=true",
+			want: info,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Metadata-Flavor", "Google")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q", got)
+			}
+			var got any
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode recursive metadata: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("recursive metadata = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+	if agent.tokenCalls != 0 {
+		t.Fatalf("recursive metadata requested a token %d times", agent.tokenCalls)
+	}
+	if agent.idCalls != 0 {
+		t.Fatalf("recursive metadata requested an identity token %d times", agent.idCalls)
 	}
 }
 
