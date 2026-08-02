@@ -1,121 +1,108 @@
+// Package core holds the daemon state machine. After the WIF redesign it is
+// deliberately narrow: it caches at most the verified PIV PIN and the
+// metadata of the last successful signature. It never holds, caches, logs, or
+// returns a Google access token, Google-issued ID token, or STS response, and
+// the only credential it can mint is a five-minute OIDC subject token for a
+// configured alias/target pair.
 package core
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/wif"
 )
 
-var (
-	ErrLocked   = errors.New("PIN is not cached; run `pivb unlock` first")
-	ErrNoToken  = errors.New("no valid access token; run `pivb use <alias>` or `pivb renew`")
-	ErrAudience = errors.New("audience is required")
-)
+var ErrLocked = errors.New("PIN is not cached; run `pivb unlock` first")
 
 type UnknownAliasError struct{ Alias string }
 
 func (e *UnknownAliasError) Error() string { return fmt.Sprintf("unknown alias %q", e.Alias) }
 
-type Minter interface {
-	Mint(ctx context.Context, request MintRequest) (MintedCredential, error)
+// RequestMismatchError reports a subject-token request whose caller-supplied
+// audience or impersonation target does not match the daemon configuration.
+// It usually means a tampered or stale credential file.
+type RequestMismatchError struct {
+	Field string
+	Got   string
+	Want  string
 }
 
-type MintPurpose string
-
-const (
-	MintAccess   MintPurpose = "access"
-	MintIdentity MintPurpose = "identity"
-)
-
-type MintRequest struct {
-	AliasName string
-	Alias     config.Alias
-	PIN       string
-	Purpose   MintPurpose
-	Audience  string
+func (e *RequestMismatchError) Error() string {
+	return fmt.Sprintf("request %s %q does not match the configured value %q; regenerate the credential file with `pivb wif credentials`", e.Field, e.Got, e.Want)
 }
 
-// MintedCredential is deliberately cloud-neutral. Fields carries provider-shaped
-// material (for GCP, access_token or token; for future AWS, the STS triple).
-type MintedCredential struct {
-	Cloud     string
-	Subject   string
-	Fields    map[string]string
-	Value     string
+// SubjectTokenRequest is the only credential operation the daemon accepts.
+// Every field is validated against configuration; none of them select
+// anything that configuration does not already bind.
+type SubjectTokenRequest struct {
+	Alias                   string
+	ExternalAccountAudience string
+	ImpersonatedEmail       string
+}
+
+type SubjectTokenResult struct {
+	IDToken   string
 	ExpiresAt time.Time
 	Serial    uint32
+	KeyID     string
 }
 
-type MintedAccess = MintedCredential
-type MintedIdentity = MintedCredential
-
-type Token struct {
-	AccessToken string            `json:"access_token"`
-	ExpiresAt   time.Time         `json:"expires_at"`
-	TargetEmail string            `json:"target_email"`
-	Cloud       string            `json:"cloud"`
-	Subject     string            `json:"subject"`
-	Credential  map[string]string `json:"credential,omitempty"`
-}
-
-type Identity struct {
-	Token      string            `json:"token"`
-	ExpiresAt  time.Time         `json:"expires_at"`
-	Cloud      string            `json:"cloud"`
-	Subject    string            `json:"subject"`
-	Credential map[string]string `json:"credential,omitempty"`
+// SignEvent records the metadata of the last successful signature for
+// card-free status reporting. It contains no token material.
+type SignEvent struct {
+	Alias  string
+	Target string
+	Serial uint32
+	KeyID  string
+	At     time.Time
 }
 
 type Status struct {
-	Cloud             string `json:"cloud"`
-	ActiveAlias       string `json:"active_alias"`
-	TargetEmail       string `json:"target_email"`
-	ProjectID         string `json:"project_id"`
-	NumericProject    string `json:"numeric_project_id,omitempty"`
-	TokenExpiresIn    int64  `json:"token_expires_in_s"`
-	PINCached         bool   `json:"pin_cached"`
-	PINVerifiedSerial uint32 `json:"pin_verified_serial"`
-	YubiKeySerial     uint32 `json:"yubikey_serial"`
-	Version           string `json:"version"`
+	PINCached         bool      `json:"pin_cached"`
+	PINVerifiedSerial uint32    `json:"pin_verified_serial"`
+	WIFProvider       string    `json:"wif_provider"`
+	LastSignAlias     string    `json:"last_sign_alias,omitempty"`
+	LastSignTarget    string    `json:"last_sign_target,omitempty"`
+	LastSignSerial    uint32    `json:"last_sign_serial,omitempty"`
+	LastSignKeyID     string    `json:"last_sign_key_id,omitempty"`
+	LastSignAt        time.Time `json:"last_sign_at,omitzero"`
+	Version           string    `json:"version"`
 }
 
 type Core struct {
 	cfg     *config.Config
 	signer  pivsigner.Signer
-	minter  Minter
 	version string
 	now     func() time.Time
+	random  io.Reader
 
+	// mintMu serializes PIV operations; mu guards cached state.
 	mintMu            sync.Mutex
 	mu                sync.RWMutex
 	pin               []byte
 	pinVerifiedSerial uint32
-	clouds            map[string]*cloudState
-	serial            uint32
+	lastSign          *SignEvent
 }
 
-type cloudState struct {
-	active string
-	token  *Token
-	ids    map[string]Identity
-}
-
-func New(cfg *config.Config, signer pivsigner.Signer, minter Minter, version string) *Core {
+func New(cfg *config.Config, signer pivsigner.Signer, version string) *Core {
 	return &Core{
-		cfg: cfg, signer: signer, minter: minter, version: version,
-		now: time.Now,
-		clouds: map[string]*cloudState{
-			"gcp": {active: cfg.DefaultAlias, ids: make(map[string]Identity)},
-		},
+		cfg: cfg, signer: signer, version: version,
+		now:    time.Now,
+		random: rand.Reader,
 	}
 }
 
 func (c *Core) SetNowForTest(now func() time.Time) { c.now = now }
+func (c *Core) SetRandomForTest(random io.Reader)  { c.random = random }
 
 func (c *Core) Unlock(ctx context.Context, pin string) (int, error) {
 	if pin == "" {
@@ -135,124 +122,113 @@ func (c *Core) Unlock(ctx context.Context, pin string) (int, error) {
 	return retries, nil
 }
 
+// Lock discards the cached PIN and the cached signing metadata.
 func (c *Core) Lock() {
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.clearPINLocked()
-	c.clearTokensLocked()
+	c.lastSign = nil
 }
 
-func (c *Core) Use(ctx context.Context, name string) (Token, error) {
-	alias, ok := c.cfg.Aliases[name]
+// SubjectToken validates the request against configuration, opens one PIV
+// signing session, and returns a five-minute RS256 OIDC subject token bound
+// to the enrolled key observed in that session. The token is returned to the
+// caller and never retained or logged by the daemon.
+func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (SubjectTokenResult, error) {
+	alias, ok := c.cfg.Aliases[req.Alias]
 	if !ok {
-		return Token{}, &UnknownAliasError{Alias: name}
+		return SubjectTokenResult{}, &UnknownAliasError{Alias: req.Alias}
 	}
+	provider := c.cfg.Provider()
+	if want := provider.ExternalAccountAudience(); req.ExternalAccountAudience != want {
+		return SubjectTokenResult{}, &RequestMismatchError{Field: "external_account_audience", Got: req.ExternalAccountAudience, Want: want}
+	}
+	if req.ImpersonatedEmail != alias.Target {
+		return SubjectTokenResult{}, &RequestMismatchError{Field: "impersonated_email", Got: req.ImpersonatedEmail, Want: alias.Target}
+	}
+	keys := c.cfg.KeysBySerial()
+
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
 	pin, err := c.takePIN()
 	if err != nil {
-		return Token{}, err
+		return SubjectTokenResult{}, err
 	}
 	defer zero(pin)
-	t, err := c.minter.Mint(ctx, MintRequest{AliasName: name, Alias: alias, PIN: string(pin), Purpose: MintAccess})
-	c.recordPINVerification(t.Serial, err)
+
+	now := c.now().UTC()
+	jti, err := wif.NewJTI(c.random)
 	if err != nil {
-		return Token{}, err
+		return SubjectTokenResult{}, err
 	}
-	fields := cloneFields(t.Fields)
-	if fields == nil {
-		fields = map[string]string{"access_token": t.Value}
+
+	var input string
+	var claims wif.Claims
+	var signedKid string
+	digestFor := func(serial uint32, cert *x509.Certificate) ([]byte, error) {
+		key, enrolled := keys[serial]
+		if !enrolled {
+			return nil, fmt.Errorf("YubiKey %d is not enrolled; add [keys.%d] to the configuration", serial, serial)
+		}
+		kid, kidErr := wif.CertificateKeyID(cert)
+		if kidErr != nil {
+			return nil, kidErr
+		}
+		if kid != key.JWKKid {
+			return nil, fmt.Errorf("live slot 9c key on YubiKey %d derives jwk_kid %q but configuration expects %q; a replaced key must be deliberately re-enrolled", serial, kid, key.JWKKid)
+		}
+		var claimsErr error
+		claims, claimsErr = wif.NewClaims(provider, req.Alias, alias.Target, serial, kid, jti, now)
+		if claimsErr != nil {
+			return nil, claimsErr
+		}
+		var inputErr error
+		input, inputErr = wif.SigningInput(claims)
+		if inputErr != nil {
+			return nil, inputErr
+		}
+		signedKid = kid
+		return wif.SigningDigest(input), nil
 	}
-	newToken := Token{AccessToken: t.Value, ExpiresAt: t.ExpiresAt, TargetEmail: alias.Target, Cloud: alias.Cloud, Subject: alias.Target, Credential: fields}
+
+	label := req.Alias + " → " + alias.Target + " (local-wif)"
+	sig, serial, err := c.signer.Sign(ctx, label, string(pin), digestFor)
+	c.recordPINVerification(serial, err)
+	if err != nil {
+		return SubjectTokenResult{}, err
+	}
+	if input == "" {
+		return SubjectTokenResult{}, errors.New("signer returned without requesting a serial-bound digest")
+	}
+	token, err := wif.Assemble(input, sig)
+	if err != nil {
+		return SubjectTokenResult{}, err
+	}
 	c.mu.Lock()
-	state := c.cloudStateLocked(alias.Cloud)
-	state.active = name
-	state.token = &newToken
-	state.ids = make(map[string]Identity)
-	c.serial = t.Serial
+	c.lastSign = &SignEvent{Alias: req.Alias, Target: alias.Target, Serial: serial, KeyID: signedKid, At: now}
 	c.mu.Unlock()
-	return newToken, nil
-}
-
-func (c *Core) Renew(ctx context.Context) (Token, error) {
-	c.mu.RLock()
-	name := c.clouds["gcp"].active
-	c.mu.RUnlock()
-	return c.Use(ctx, name)
-}
-
-func (c *Core) Token() (Token, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	state := c.clouds["gcp"]
-	if state.token == nil || !state.token.ExpiresAt.After(c.now()) {
-		return Token{}, ErrNoToken
-	}
-	return *state.token, nil
-}
-
-func (c *Core) Identity(ctx context.Context, audience string) (Identity, error) {
-	if audience == "" {
-		return Identity{}, ErrAudience
-	}
-	c.mu.RLock()
-	state := c.clouds["gcp"]
-	if id, ok := state.ids[audience]; ok && id.ExpiresAt.After(c.now()) {
-		c.mu.RUnlock()
-		return id, nil
-	}
-	c.mu.RUnlock()
-
-	c.mintMu.Lock()
-	defer c.mintMu.Unlock()
-	// Recheck after acquiring the mint lock.
-	c.mu.RLock()
-	state = c.clouds["gcp"]
-	if id, ok := state.ids[audience]; ok && id.ExpiresAt.After(c.now()) {
-		c.mu.RUnlock()
-		return id, nil
-	}
-	name := state.active
-	c.mu.RUnlock()
-	alias := c.cfg.Aliases[name]
-	pin, err := c.takePIN()
-	if err != nil {
-		return Identity{}, err
-	}
-	defer zero(pin)
-	t, err := c.minter.Mint(ctx, MintRequest{AliasName: name, Alias: alias, PIN: string(pin), Purpose: MintIdentity, Audience: audience})
-	c.recordPINVerification(t.Serial, err)
-	if err != nil {
-		return Identity{}, err
-	}
-	fields := cloneFields(t.Fields)
-	if fields == nil {
-		fields = map[string]string{"token": t.Value}
-	}
-	id := Identity{Token: t.Value, ExpiresAt: t.ExpiresAt, Cloud: alias.Cloud, Subject: alias.Target, Credential: fields}
-	c.mu.Lock()
-	c.cloudStateLocked(alias.Cloud).ids[audience] = id
-	c.serial = t.Serial
-	c.mu.Unlock()
-	return id, nil
+	return SubjectTokenResult{IDToken: token, ExpiresAt: claims.ExpiresAt(), Serial: serial, KeyID: signedKid}, nil
 }
 
 func (c *Core) Status() Status {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	state := c.clouds["gcp"]
-	alias := c.cfg.Aliases[state.active]
-	expires := int64(0)
-	if state.token != nil && state.token.ExpiresAt.After(c.now()) {
-		expires = int64(state.token.ExpiresAt.Sub(c.now()).Seconds())
+	status := Status{
+		PINCached:         len(c.pin) != 0,
+		PINVerifiedSerial: c.pinVerifiedSerial,
+		WIFProvider:       c.cfg.Provider().Resource(),
+		Version:           c.version,
 	}
-	return Status{
-		Cloud: alias.Cloud, ActiveAlias: state.active, TargetEmail: alias.Target, ProjectID: alias.ProjectID,
-		NumericProject: alias.NumericProjectID, TokenExpiresIn: expires,
-		PINCached: len(c.pin) != 0, PINVerifiedSerial: c.pinVerifiedSerial, YubiKeySerial: c.serial, Version: c.version,
+	if c.lastSign != nil {
+		status.LastSignAlias = c.lastSign.Alias
+		status.LastSignTarget = c.lastSign.Target
+		status.LastSignSerial = c.lastSign.Serial
+		status.LastSignKeyID = c.lastSign.KeyID
+		status.LastSignAt = c.lastSign.At
 	}
+	return status
 }
 
 func (c *Core) takePIN() ([]byte, error) {
@@ -274,11 +250,14 @@ func (c *Core) clearPINLocked() {
 	c.pinVerifiedSerial = 0
 }
 
-func (c *Core) recordPINVerification(serial uint32, mintErr error) {
+// recordPINVerification updates cached-PIN state after a signing attempt. A
+// nonzero serial means the signer verified the cached PIN against that card
+// during the operation; a PINError can demand the cache be dropped.
+func (c *Core) recordPINVerification(serial uint32, signErr error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var pinErr *pivsigner.PINError
-	if errors.As(mintErr, &pinErr) {
+	if errors.As(signErr, &pinErr) {
 		if pinErr.ClearCachedPIN {
 			c.clearPINLocked()
 		}
@@ -289,40 +268,8 @@ func (c *Core) recordPINVerification(serial uint32, mintErr error) {
 	}
 }
 
-func (c *Core) clearTokensLocked() {
-	for _, state := range c.clouds {
-		if state.token != nil {
-			// Go strings cannot be reliably zeroed. This includes token fields created
-			// during JSON decoding and PIN strings crossing API/signer boundaries;
-			// sever every retained reference as soon as its lifetime ends.
-			state.token = nil
-		}
-		state.ids = make(map[string]Identity)
-	}
-}
-
-func (c *Core) cloudStateLocked(cloud string) *cloudState {
-	state := c.clouds[cloud]
-	if state == nil {
-		state = &cloudState{ids: make(map[string]Identity)}
-		c.clouds[cloud] = state
-	}
-	return state
-}
-
 func zero(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
-}
-
-func cloneFields(fields map[string]string) map[string]string {
-	if fields == nil {
-		return nil
-	}
-	copyFields := make(map[string]string, len(fields))
-	for key, value := range fields {
-		copyFields[key] = value
-	}
-	return copyFields
 }

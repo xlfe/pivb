@@ -1,5 +1,5 @@
 [Unit]
-Description=YubiKey PIV to GCP service-account broker
+Description=YubiKey PIV Workload Identity Federation signer
 Documentation=https://github.com/xlfe/pivb
 After=graphical-session.target
 
@@ -8,6 +8,39 @@ Type=simple
 ExecStart=@pivb@ serve
 Restart=on-failure
 RestartSec=2s
+
+# pivbd is a networkless signer: it serves two Unix sockets under
+# $XDG_RUNTIME_DIR/pivb and reaches only /run/pcscd/pcscd.comm, gpgconf, and
+# the session bus for notifications. PrivateNetwork is the primary network
+# boundary; everything else reduces ambient surface. Verify the effective
+# sandbox with `systemd-analyze security --user pivb.service` plus the live
+# PC/SC, gpgconf-kill, and notification checks before trusting a change to
+# this block.
+UMask=0077
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RuntimeDirectory=pivb
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=default.target

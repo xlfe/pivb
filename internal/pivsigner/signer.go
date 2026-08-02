@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -41,9 +42,14 @@ func (e *PINError) Error() string {
 
 func (e *PINError) Unwrap() error { return e.Err }
 
+// Signer is the hardware seam. Sign opens one ephemeral PIV session, reads
+// the live slot-9c certificate, and asks digestFor for the digest to sign.
+// digestFor receives the serial and certificate observed inside that same
+// session, so the caller can bind claims to the exact key that will sign and
+// refuse a certificate that no longer matches enrolled configuration.
 type Signer interface {
 	VerifyPIN(ctx context.Context, pin string) (serial uint32, retries int, err error)
-	Sign(ctx context.Context, alias, pin string, digestFor func(serial uint32) ([]byte, error)) (signature []byte, serial uint32, err error)
+	Sign(ctx context.Context, label, pin string, digestFor func(serial uint32, cert *x509.Certificate) ([]byte, error)) (signature []byte, serial uint32, err error)
 }
 
 type Hardware struct {
@@ -86,7 +92,7 @@ func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, erro
 	return serial, retries, nil
 }
 
-func (h *Hardware) Sign(ctx context.Context, alias, pin string, digestFor func(uint32) ([]byte, error)) ([]byte, uint32, error) {
+func (h *Hardware) Sign(ctx context.Context, label, pin string, digestFor func(uint32, *x509.Certificate) ([]byte, error)) ([]byte, uint32, error) {
 	deadline := h.Deadline
 	if deadline == 0 {
 		deadline = 20 * time.Second
@@ -94,7 +100,7 @@ func (h *Hardware) Sign(ctx context.Context, alias, pin string, digestFor func(u
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 
-	sig, serial, err := h.signAttempt(ctx, alias, pin, digestFor)
+	sig, serial, err := h.signAttempt(ctx, label, pin, digestFor)
 	if err == nil || !IsSharingViolation(err) {
 		return sig, serial, err
 	}
@@ -102,7 +108,7 @@ func (h *Hardware) Sign(ctx context.Context, alias, pin string, digestFor func(u
 	if killErr := exec.CommandContext(ctx, "gpgconf", "--kill", "scdaemon").Run(); killErr != nil {
 		return nil, 0, fmt.Errorf("sharing violation; kill scdaemon before retry: %w", killErr)
 	}
-	return h.signAttempt(ctx, alias, pin, digestFor)
+	return h.signAttempt(ctx, label, pin, digestFor)
 }
 
 type signResult struct {
@@ -111,7 +117,7 @@ type signResult struct {
 	err    error
 }
 
-func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digestFor func(uint32) ([]byte, error)) ([]byte, uint32, error) {
+func (h *Hardware) signAttempt(ctx context.Context, label, pin string, digestFor func(uint32, *x509.Certificate) ([]byte, error)) ([]byte, uint32, error) {
 	result := make(chan signResult, 1)
 	go func() {
 		yk, serial, err := h.openSelected()
@@ -120,23 +126,26 @@ func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digestFor
 			return
 		}
 		defer yk.Close()
-		digest, err := digestFor(serial)
+		// Failures before verifyCachedPIN must not report a serial: a nonzero
+		// serial in the result tells the caller the cached PIN was verified
+		// against that card during this operation.
+		cert, err := yk.Certificate(piv.SlotSignature)
+		if err != nil {
+			result <- signResult{err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)}
+			return
+		}
+		public, ok := cert.PublicKey.(*rsa.PublicKey)
+		if !ok || public.N.BitLen() != 2048 {
+			result <- signResult{err: fmt.Errorf("PIV slot 9c on YubiKey %d must contain an RSA-2048 certificate", serial)}
+			return
+		}
+		digest, err := digestFor(serial, cert)
 		if err != nil {
 			result <- signResult{err: fmt.Errorf("build signing digest for YubiKey %d: %w", serial, err)}
 			return
 		}
 		if err := h.verifyCachedPIN(yk, serial, pin); err != nil {
 			result <- signResult{err: err}
-			return
-		}
-		cert, err := yk.Certificate(piv.SlotSignature)
-		if err != nil {
-			result <- signResult{serial: serial, err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)}
-			return
-		}
-		public, ok := cert.PublicKey.(*rsa.PublicKey)
-		if !ok || public.N.BitLen() != 2048 {
-			result <- signResult{serial: serial, err: fmt.Errorf("PIV slot 9c on YubiKey %d must contain an RSA-2048 certificate", serial)}
 			return
 		}
 		key, err := yk.PrivateKey(piv.SlotSignature, cert.PublicKey, piv.KeyAuth{PIN: pin})
@@ -149,7 +158,7 @@ func (h *Hardware) signAttempt(ctx context.Context, alias, pin string, digestFor
 			result <- signResult{serial: serial, err: errors.New("PIV private key does not implement crypto.Signer")}
 			return
 		}
-		h.notify("Touch YubiKey to mint " + alias)
+		h.notify("Touch YubiKey to sign " + label)
 		sig, err := signer.Sign(rand.Reader, digest, crypto.SHA256)
 		if err != nil {
 			err = fmt.Errorf("sign with PIV slot 9c on YubiKey %d: %w", serial, err)

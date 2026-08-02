@@ -6,26 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/xlfe/pivb/internal/core"
+	"github.com/xlfe/pivb/internal/uds"
 )
 
 type Client struct {
 	HTTP *http.Client
 }
 
+// NewClient returns a control-socket client. The timeout covers unlock, which
+// performs one PIV PIN verification.
 func NewClient(socket string) *Client {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		},
-	}
-	return &Client{HTTP: &http.Client{Transport: transport, Timeout: 40 * time.Second}}
+	return &Client{HTTP: uds.NewHTTPClient(socket, 40*time.Second)}
 }
 
 func (c *Client) Status(ctx context.Context) (core.Status, error) {
@@ -46,30 +42,6 @@ func (c *Client) Lock(ctx context.Context) error {
 	return c.call(ctx, http.MethodPost, "/v1/lock", map[string]any{}, &struct{}{})
 }
 
-func (c *Client) Use(ctx context.Context, alias string) (core.Token, error) {
-	var out core.Token
-	err := c.call(ctx, http.MethodPost, "/v1/use", map[string]string{"alias": alias}, &out)
-	return out, err
-}
-
-func (c *Client) Renew(ctx context.Context) (core.Token, error) {
-	var out core.Token
-	err := c.call(ctx, http.MethodPost, "/v1/renew", map[string]any{}, &out)
-	return out, err
-}
-
-func (c *Client) Token(ctx context.Context) (core.Token, error) {
-	var out core.Token
-	err := c.call(ctx, http.MethodGet, "/v1/token", nil, &out)
-	return out, err
-}
-
-func (c *Client) Identity(ctx context.Context, audience string) (core.Identity, error) {
-	var out core.Identity
-	err := c.call(ctx, http.MethodGet, "/v1/identity?audience="+url.QueryEscape(audience), nil, &out)
-	return out, err
-}
-
 type HTTPError struct {
 	Status       int
 	Body         []byte
@@ -79,9 +51,9 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string {
 	if e.Remedy != "" {
-		return fmt.Sprintf("agent HTTP %d: %s (remedy: %s)", e.Status, e.ErrorMessage, e.Remedy)
+		return fmt.Sprintf("control API HTTP %d: %s (remedy: %s)", e.Status, e.ErrorMessage, e.Remedy)
 	}
-	return fmt.Sprintf("agent HTTP %d: %s", e.Status, e.ErrorMessage)
+	return fmt.Sprintf("control API HTTP %d: %s", e.Status, e.ErrorMessage)
 }
 
 func (c *Client) call(ctx context.Context, method, path string, input, output any) error {
@@ -102,12 +74,12 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("call pivb agent: %w", err)
+		return fmt.Errorf("call pivb control socket: %w", err)
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, uds.MaxResponseBody+1))
 	if err != nil {
-		return fmt.Errorf("read pivb agent response: %w", err)
+		return fmt.Errorf("read pivb control response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var er errorResponse
@@ -118,7 +90,7 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 		return &HTTPError{Status: resp.StatusCode, Body: b, ErrorMessage: er.Error, Remedy: er.Remedy}
 	}
 	if err := json.Unmarshal(b, output); err != nil {
-		return fmt.Errorf("decode pivb agent response: %w", err)
+		return fmt.Errorf("decode pivb control response: %w", err)
 	}
 	return nil
 }

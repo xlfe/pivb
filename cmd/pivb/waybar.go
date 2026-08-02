@@ -16,10 +16,7 @@ import (
 	"github.com/xlfe/pivb/internal/core"
 )
 
-const (
-	waybarExpiringSeconds = int64(240)
-	statusRequestTimeout  = 2 * time.Second
-)
+const statusRequestTimeout = 2 * time.Second
 
 type statusAgent interface {
 	Status(context.Context) (core.Status, error)
@@ -99,7 +96,7 @@ func writeStatus(parent context.Context, client statusAgent, format string, out 
 		return encoder.Encode(status)
 	}
 	if format == "waybar" {
-		return encoder.Encode(formatWaybarStatus(status, statusErr))
+		return encoder.Encode(formatWaybarStatus(status, statusErr, time.Now()))
 	}
 	if statusErr != nil {
 		return encoder.Encode(watchedStatusError{Unavailable: true, Error: oneLine(statusErr.Error())})
@@ -107,55 +104,24 @@ func writeStatus(parent context.Context, client statusAgent, format string, out 
 	return encoder.Encode(status)
 }
 
-func formatWaybarStatus(status core.Status, statusErr error) waybarStatus {
+func formatWaybarStatus(status core.Status, statusErr error, now time.Time) waybarStatus {
 	if statusErr != nil {
 		return waybarStatus{
-			Text:    " pivb",
-			Tooltip: "pivb · unavailable\nAgent is not responding\n" + oneLine(statusErr.Error()) + "\nRun: systemctl --user status pivb",
+			Text:    " pivb",
+			Tooltip: "pivb · unavailable\nDaemon is not responding\n" + oneLine(statusErr.Error()) + "\nRun: systemctl --user status pivb",
 			Class:   "unavailable",
 			Alt:     "unavailable",
 		}
 	}
 
 	state := "locked"
-	icon := ""
-	if status.TokenExpiresIn > 0 {
-		state = "active"
-		icon = ""
-		if status.TokenExpiresIn < waybarExpiringSeconds {
-			state = "expiring"
-			icon = ""
-		}
-	} else if status.PINCached {
+	icon := ""
+	if status.PINCached {
 		state = "ready"
-		icon = ""
+		icon = ""
 	}
 
-	alias := status.ActiveAlias
-	if alias == "" {
-		alias = "unknown"
-	}
-	text := icon + " " + alias
-	if status.TokenExpiresIn > 0 {
-		text += " · " + expiryMinutes(status.TokenExpiresIn)
-	}
-
-	lines := []string{"pivb · " + state, "Identity: " + alias}
-	if status.TargetEmail != "" {
-		lines = append(lines, "Account: "+status.TargetEmail)
-	}
-	if status.ProjectID != "" {
-		project := status.ProjectID
-		if status.NumericProject != "" {
-			project += " (" + status.NumericProject + ")"
-		}
-		lines = append(lines, "Project: "+project)
-	}
-	if status.TokenExpiresIn > 0 {
-		lines = append(lines, "Token expires in "+expiryMinutes(status.TokenExpiresIn))
-	} else {
-		lines = append(lines, "No active token")
-	}
+	lines := []string{"pivb · " + state}
 	if status.PINCached {
 		pin := "PIN cached"
 		if status.PINVerifiedSerial != 0 {
@@ -163,29 +129,38 @@ func formatWaybarStatus(status core.Status, statusErr error) waybarStatus {
 		}
 		lines = append(lines, pin)
 	} else {
-		lines = append(lines, "PIN not cached")
+		lines = append(lines, "PIN not cached — run `pivb unlock`")
 	}
-	if status.YubiKeySerial != 0 && status.YubiKeySerial != status.PINVerifiedSerial {
-		lines = append(lines, fmt.Sprintf("Token signed by key %d", status.YubiKeySerial))
+	if status.LastSignAlias != "" {
+		lines = append(lines, "Last mint: "+status.LastSignAlias+" → "+status.LastSignTarget)
+		lines = append(lines, fmt.Sprintf("Signed %s by key %d", agoText(now.Sub(status.LastSignAt)), status.LastSignSerial))
+	} else {
+		lines = append(lines, "No mints since unlock")
+	}
+	if status.WIFProvider != "" {
+		lines = append(lines, "Provider: "+status.WIFProvider)
 	}
 	if status.Version != "" {
 		lines = append(lines, "pivb "+status.Version)
 	}
-	lines = append(lines, "Click for credential actions")
 
 	return waybarStatus{
-		Text:    text,
+		Text:    icon + " pivb",
 		Tooltip: strings.Join(lines, "\n"),
 		Class:   state,
 		Alt:     state,
 	}
 }
 
-func expiryMinutes(seconds int64) string {
-	if seconds < 1 {
-		seconds = 1
+func agoText(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh%02dm ago", int(d.Hours()), int(d.Minutes())%60)
 	}
-	return fmt.Sprintf("%dm", (seconds+59)/60)
 }
 
 func oneLine(value string) string {

@@ -1,24 +1,33 @@
 piv_slot = "9c"
-pin_cache = "session"
-notify_cmd = ["notify-send", "pivb"]
-listen_metadata = "127.0.0.1:8642"
-default_alias = "ro"
+pin_cache = "session" # or "never": consume the cached PIN on each mint
+notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
 
-[keys.12345678] # replace with an enrolled serial, dedicated broker SA, and uploaded key ID
-broker_sa = "pivb-broker-12345678@example-project-id.iam.gserviceaccount.com"
-key_id = "replace-with-first-uploaded-key-id"
+[wif]
+# Numeric project number of the project hosting the workload identity pool,
+# not the project ID.
+project_number = "123456789012"
+pool_id = "pivb"
+provider_id = "yubikey-piv"
+# Durable HTTPS trust-domain identifier. No metadata endpoint is hosted there,
+# but the value must be unique to this deployment and never a Google issuer.
+issuer_uri = "https://auth.example.net/pivb/replace-with-deployment-id"
+
+# One table per enrolled YubiKey. jwk_kid is the unpadded base64url SHA-256 of
+# the slot-9c public key's DER SubjectPublicKeyInfo; `pivb wif jwks` derives it
+# and names the expected value when it does not match.
+[keys.12345678]
+jwk_kid = "replace-with-43-char-base64url-spki-digest0"
 
 [keys.23456789]
-broker_sa = "pivb-broker-23456789@example-project-id.iam.gserviceaccount.com"
-key_id = "replace-with-second-uploaded-key-id"
+jwk_kid = "replace-with-43-char-base64url-spki-digest1"
 
+# One alias per target service account. Each alias gets its own credential
+# file, provider-condition pair, and per-target Workload Identity User binding.
 [aliases.ro]
-cloud = "gcp" # optional in v1; defaults to gcp
+cloud = "gcp" # optional; gcp is the only supported value
 target = "readonly-sa@example-project-id.iam.gserviceaccount.com"
-project_id = "example-project-id"
-lifetime_s = 3600
+lifetime_s = 3600 # target access-token lifetime, 600..3600
 
 [aliases.deploy]
 target = "deployment-sa@example-project-id.iam.gserviceaccount.com"
-project_id = "example-project-id"
 lifetime_s = 3600

@@ -1,0 +1,169 @@
+// Package wif implements the OIDC subject-token, JWKS, and credential-file
+// primitives for Google Workload Identity Federation with executable-sourced
+// credentials. It performs no I/O with Google: pivb only mints five-minute
+// RS256 assertions; STS exchange and impersonation belong to the calling
+// Google auth library.
+package wif
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"time"
+)
+
+const (
+	// TokenType is the OIDC subject token type used in credential files, the
+	// executable protocol, and the STS exchange.
+	TokenType = "urn:ietf:params:oauth:token-type:id_token"
+
+	// SubjectPrefix namespaces every federated subject to an enrolled key.
+	SubjectPrefix = "pivb-key:"
+
+	// Lifetime is the hard-coded validity window of a subject token. It is a
+	// security cap, not a tunable.
+	Lifetime = 300 * time.Second
+
+	// ClockSkew backdates iat so a slightly slow verifier clock still accepts
+	// a freshly signed token. exp remains iat+Lifetime, so the usable window
+	// after signing is Lifetime-ClockSkew.
+	ClockSkew = 30 * time.Second
+
+	jtiBytes = 16
+)
+
+// Provider identifies one workload identity pool OIDC provider. All audience
+// forms are derived from it; none are accepted as free-form input.
+type Provider struct {
+	ProjectNumber string
+	PoolID        string
+	ProviderID    string
+	IssuerURI     string
+}
+
+// Resource returns the provider resource name without a scheme or host.
+func (p Provider) Resource() string {
+	return "projects/" + p.ProjectNumber +
+		"/locations/global/workloadIdentityPools/" + p.PoolID +
+		"/providers/" + p.ProviderID
+}
+
+// ExternalAccountAudience is the audience used in external-account credential
+// files and STS exchange requests.
+func (p Provider) ExternalAccountAudience() string {
+	return "//iam.googleapis.com/" + p.Resource()
+}
+
+// OIDCAudience is the aud claim required by the workload identity provider.
+func (p Provider) OIDCAudience() string {
+	return "https://iam.googleapis.com/" + p.Resource()
+}
+
+type header struct {
+	Alg string `json:"alg"`
+	Typ string `json:"typ"`
+	Kid string `json:"kid"`
+}
+
+// Claims is the fixed OIDC subject-token claim set. The daemon never accepts
+// caller-supplied claims, audiences, or targets; every field is derived from
+// validated configuration and the live signing session.
+type Claims struct {
+	Iss    string `json:"iss"`
+	Sub    string `json:"sub"`
+	Aud    string `json:"aud"`
+	Iat    int64  `json:"iat"`
+	Exp    int64  `json:"exp"`
+	Jti    string `json:"jti"`
+	Alias  string `json:"alias"`
+	Target string `json:"target"`
+	Serial string `json:"serial"`
+	KeyID  string `json:"key_id"`
+}
+
+// ExpiresAt returns the exp claim as a time.
+func (c Claims) ExpiresAt() time.Time { return time.Unix(c.Exp, 0).UTC() }
+
+// NewJTI returns a 128-bit random base64url token identifier. Pass a CSPRNG
+// (crypto/rand.Reader in production; tests may inject a fixed stream).
+func NewJTI(random io.Reader) (string, error) {
+	b := make([]byte, jtiBytes)
+	if _, err := io.ReadFull(random, b); err != nil {
+		return "", fmt.Errorf("generate jti: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// NewClaims builds the claim set for one enrolled key and one configured
+// alias/target pair. Every field is required; empty inputs fail closed.
+func NewClaims(p Provider, alias, target string, serial uint32, keyID, jti string, now time.Time) (Claims, error) {
+	switch {
+	case p.ProjectNumber == "" || p.PoolID == "" || p.ProviderID == "":
+		return Claims{}, errors.New("wif provider is incompletely configured")
+	case p.IssuerURI == "":
+		return Claims{}, errors.New("wif issuer_uri is not configured")
+	case alias == "" || target == "":
+		return Claims{}, errors.New("subject-token alias and target are required")
+	case serial == 0:
+		return Claims{}, errors.New("subject-token serial must be nonzero")
+	case keyID == "":
+		return Claims{}, errors.New("subject-token key ID is required")
+	case jti == "":
+		return Claims{}, errors.New("subject-token jti is required")
+	case now.IsZero():
+		return Claims{}, errors.New("subject-token signing time is required")
+	}
+	iat := now.Add(-ClockSkew).Unix()
+	return Claims{
+		Iss:    p.IssuerURI,
+		Sub:    SubjectPrefix + keyID,
+		Aud:    p.OIDCAudience(),
+		Iat:    iat,
+		Exp:    iat + int64(Lifetime/time.Second),
+		Jti:    jti,
+		Alias:  alias,
+		Target: target,
+		Serial: strconv.FormatUint(uint64(serial), 10),
+		KeyID:  keyID,
+	}, nil
+}
+
+// SigningInput returns the RS256 JWS signing input HEADER.PAYLOAD for the
+// claim set, with the JWK key ID bound into the protected header.
+func SigningInput(claims Claims) (string, error) {
+	if claims.KeyID == "" {
+		return "", errors.New("claims have no key ID")
+	}
+	h, err := json.Marshal(header{Alg: "RS256", Typ: "JWT", Kid: claims.KeyID})
+	if err != nil {
+		return "", fmt.Errorf("marshal JWS header: %w", err)
+	}
+	c, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("marshal JWT claims: %w", err)
+	}
+	enc := base64.RawURLEncoding
+	return enc.EncodeToString(h) + "." + enc.EncodeToString(c), nil
+}
+
+// SigningDigest returns the SHA-256 digest that the PIV key must sign with
+// PKCS#1 v1.5 to complete the RS256 JWS over input.
+func SigningDigest(input string) []byte {
+	sum := sha256.Sum256([]byte(input))
+	return sum[:]
+}
+
+// Assemble joins the signing input and raw RS256 signature into a compact JWS.
+func Assemble(input string, signature []byte) (string, error) {
+	if input == "" {
+		return "", errors.New("empty JWS signing input")
+	}
+	if len(signature) == 0 {
+		return "", errors.New("empty RS256 signature")
+	}
+	return input + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+}

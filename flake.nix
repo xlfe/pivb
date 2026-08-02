@@ -1,5 +1,5 @@
 {
-  description = "pivb — YubiKey PIV to GCP service-account broker";
+  description = "pivb — networkless YubiKey PIV Workload Identity Federation signer for Google Cloud";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -13,7 +13,7 @@
           pkgs = import nixpkgs { inherit system; };
           pivb = pkgs.buildGoModule {
             pname = "pivb";
-            version = "0.1.0";
+            version = "0.2.0";
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
               filter = path: type:
@@ -27,7 +27,7 @@
             ldflags = [
               "-s"
               "-w"
-              "-X github.com/xlfe/pivb/internal/version.Value=0.1.0"
+              "-X github.com/xlfe/pivb/internal/version.Value=0.2.0"
             ];
             postInstall = ''
               install -Dm644 systemd/pivb.service $out/lib/systemd/user/pivb.service
@@ -35,7 +35,7 @@
                 --replace-fail '@pivb@' "$out/bin/pivb"
             '';
             meta = {
-              description = "Touch-gated YubiKey PIV broker for GCP service accounts";
+              description = "Touch-gated networkless YubiKey PIV WIF signer for Google Cloud";
               mainProgram = "pivb";
               platforms = pkgs.lib.platforms.linux;
             };

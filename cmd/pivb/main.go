@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,14 +17,18 @@ import (
 	"github.com/xlfe/pivb/internal/agentapi"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
-	"github.com/xlfe/pivb/internal/gcp"
-	"github.com/xlfe/pivb/internal/metadata"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/uds"
 	"github.com/xlfe/pivb/internal/version"
+	"github.com/xlfe/pivb/internal/wifapi"
 )
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, errReported) {
+			// subject-token already wrote its machine-readable error to stdout.
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "pivb:", err)
 		if errors.Is(err, errPinentryCancelled) {
 			os.Exit(2)
@@ -42,9 +44,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	defaultAgent := agentSocketPath()
 	configPath := global.String("config", defaultConfig, "configuration file")
-	agentPath := global.String("agent", defaultAgent, "agent Unix socket")
+	controlSocket := global.String("control-socket", runtimeSocketPath("control.sock"), "control Unix socket (status, unlock, lock)")
+	wifSocket := global.String("wif-socket", runtimeSocketPath("wif.sock"), "WIF signing Unix socket")
 	if err := global.Parse(args); err != nil {
 		return err
 	}
@@ -53,23 +55,30 @@ func run(args []string) error {
 		return errors.New("a command is required")
 	}
 	cmd, rest := global.Arg(0), global.Args()[1:]
-	if cmd == "version" {
+	switch cmd {
+	case "version":
 		fmt.Println(version.Value)
 		return nil
-	}
-	if *agentPath == "" && cmd != "metadata" {
-		return errors.New("XDG_RUNTIME_DIR is not set; pass --agent explicitly")
-	}
-	if cmd == "serve" {
+	case "serve":
 		if len(rest) != 0 {
 			return errors.New("serve takes no arguments")
 		}
-		return serve(*configPath, *agentPath)
+		if *controlSocket == "" || *wifSocket == "" {
+			return errors.New("XDG_RUNTIME_DIR is not set; pass --control-socket and --wif-socket explicitly")
+		}
+		return serve(*configPath, *controlSocket, *wifSocket)
+	case "subject-token":
+		// Machine interface: every outcome is reported as protocol JSON on
+		// stdout, including environment and configuration failures.
+		return subjectTokenCommand(*configPath, *wifSocket, rest, os.Stdout, os.Stderr)
+	case "wif":
+		return wifCommand(*configPath, rest)
 	}
-	if cmd == "metadata" {
-		return metadataCommand(*agentPath, rest)
+
+	if *controlSocket == "" {
+		return errors.New("XDG_RUNTIME_DIR is not set; pass --control-socket explicitly")
 	}
-	client := agentapi.NewClient(*agentPath)
+	client := agentapi.NewClient(*controlSocket)
 	if cmd == "status" {
 		defer client.HTTP.CloseIdleConnections()
 		return statusCommand(client, rest, os.Stdout)
@@ -86,43 +95,7 @@ func run(args []string) error {
 		if err := client.Lock(ctx); err != nil {
 			return err
 		}
-		fmt.Println("locked; cached PIN and tokens discarded")
-	case "use":
-		if len(rest) != 1 {
-			return errors.New("usage: pivb use <alias>")
-		}
-		token, err := client.Use(ctx, rest[0])
-		if err != nil {
-			return err
-		}
-		fmt.Printf("now serving %s until %s\n", token.TargetEmail, token.ExpiresAt.Local().Format(time.RFC3339))
-	case "renew":
-		if len(rest) != 0 {
-			return errors.New("renew takes no arguments")
-		}
-		token, err := client.Renew(ctx)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("renewed %s until %s\n", token.TargetEmail, token.ExpiresAt.Local().Format(time.RFC3339))
-	case "token":
-		fs := flag.NewFlagSet("token", flag.ContinueOnError)
-		printToken := fs.Bool("print", false, "print the access token to stdout")
-		if err := fs.Parse(rest); err != nil {
-			return err
-		}
-		if fs.NArg() != 0 {
-			return errors.New("token takes no positional arguments")
-		}
-		token, err := client.Token(ctx)
-		if err != nil {
-			return err
-		}
-		if *printToken {
-			fmt.Println(token.AccessToken)
-		} else {
-			fmt.Printf("token for %s expires at %s (use --print to reveal it)\n", token.TargetEmail, token.ExpiresAt.Local().Format(time.RFC3339))
-		}
+		fmt.Println("locked; cached PIN and signing metadata discarded")
 	default:
 		usage(global)
 		return fmt.Errorf("unknown command %q", cmd)
@@ -130,7 +103,7 @@ func run(args []string) error {
 	return nil
 }
 
-func serve(configPath, socket string) error {
+func serve(configPath, controlSocket, wifSocket string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -139,89 +112,41 @@ func serve(configPath, socket string) error {
 	if err := pivsigner.CheckPCSC(); err != nil {
 		return err
 	}
-	keys := cfg.KeysBySerial()
 	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger}
-	minter := &gcp.Minter{Signer: signer, Keys: keys, Logger: logger}
-	agentCore := core.New(cfg, signer, minter, version.Value)
-	api := &agentapi.API{Core: agentCore}
+	daemonCore := core.New(cfg, signer, version.Value)
+	control := &agentapi.API{Core: daemonCore}
+	signing := &wifapi.API{Core: daemonCore, Logger: logger}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	errCh := make(chan error, 2)
-	go func() {
-		errCh <- agentapi.ServeUnix(ctx, socket, api.Handler(true))
-	}()
+	go func() { errCh <- uds.Serve(ctx, controlSocket, control.Handler()) }()
+	go func() { errCh <- uds.Serve(ctx, wifSocket, signing.Handler()) }()
+	logger.Info("pivb serving",
+		"control_socket", controlSocket,
+		"wif_socket", wifSocket,
+		"wif_provider", cfg.Provider().Resource())
 
-	frontend := &metadata.Frontend{Agent: agentapi.NewClient(socket), Notify: cfg.NotifyCmd, Logger: logger}
-	metadataServer := &http.Server{
-		Addr: cfg.ListenMetadata, Handler: frontend.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	go func() {
-		logger.Info("pivb serving", "agent_socket", socket, "metadata", cfg.ListenMetadata)
-		err := metadataServer.ListenAndServe()
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
+	var exitErr error
+	for range 2 {
+		if err := <-errCh; err != nil && exitErr == nil {
+			exitErr = err
 		}
-		errCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-	case err := <-errCh:
-		if err != nil {
-			cancel(err)
-		}
+		// The first server to exit (error or signal) stops its sibling.
+		cancel()
 	}
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	_ = metadataServer.Shutdown(shutdownCtx)
-	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
-		return cause
-	}
-	return nil
+	return exitErr
 }
 
-func metadataCommand(defaultAgent string, args []string) error {
-	fs := flag.NewFlagSet("metadata", flag.ContinueOnError)
-	agent := fs.String("agent", defaultAgent, "forwarded agent Unix socket")
-	listen := fs.String("listen", "127.0.0.1:8642", "metadata listen address")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 0 {
-		return errors.New("metadata takes no positional arguments")
-	}
-	if *agent == "" {
-		return errors.New("XDG_RUNTIME_DIR is not set; pass metadata --agent explicitly")
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	server := &http.Server{
-		Addr: *listen, Handler: (&metadata.Frontend{Agent: agentapi.NewClient(*agent)}).Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		server.Shutdown(shutdownCtx)
-	}()
-	err := server.ListenAndServe()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-	return err
-}
-
-func agentSocketPath() string {
+func runtimeSocketPath(name string) string {
 	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
 	if runtimeDir == "" {
 		return ""
 	}
-	return filepath.Join(runtimeDir, "pivb", "agent.sock")
+	return filepath.Join(runtimeDir, "pivb", name)
 }
 
 func readPIN() ([]byte, error) {
@@ -237,12 +162,6 @@ func readPIN() ([]byte, error) {
 	return pin, nil
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
 func zero(b []byte) {
 	for i := range b {
 		b[i] = 0
@@ -250,6 +169,14 @@ func zero(b []byte) {
 }
 
 func usage(fs *flag.FlagSet) {
-	fmt.Fprintf(fs.Output(), "usage: pivb [--config path] [--agent socket] <command>\n\n")
-	fmt.Fprintln(fs.Output(), "commands: serve, unlock [--if-needed] [--pinentry-program path], lock, use <alias>, renew, status [--watch duration] [--format json|waybar], token [--print], metadata, version")
+	fmt.Fprintf(fs.Output(), "usage: pivb [--config path] [--control-socket path] [--wif-socket path] <command>\n\ncommands:\n")
+	fmt.Fprintln(fs.Output(), "  serve                                    run the networkless signing daemon")
+	fmt.Fprintln(fs.Output(), "  unlock [--if-needed] [--pinentry-program p]   verify and cache the PIV PIN")
+	fmt.Fprintln(fs.Output(), "  lock                                     drop the cached PIN and signing metadata")
+	fmt.Fprintln(fs.Output(), "  status [--watch d] [--format json|waybar]     card-free daemon status")
+	fmt.Fprintln(fs.Output(), "  subject-token --alias <alias>            executable credential source (machine interface)")
+	fmt.Fprintln(fs.Output(), "  wif jwks --cert <serial>=<pem> ...       build the uploaded JWKS from enrolled certificates")
+	fmt.Fprintln(fs.Output(), "  wif credentials --alias <a> --output <f> --executable <p>   write one credential file")
+	fmt.Fprintln(fs.Output(), "  wif provider-condition                   print provider mapping and condition for gcloud")
+	fmt.Fprintln(fs.Output(), "  version")
 }
