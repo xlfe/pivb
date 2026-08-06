@@ -399,17 +399,28 @@ on disk is prohibited, and the helper refuses to run if a hand-edited file sets
 The file holds no private key and no bearer token, but its `command` decides which
 executable receives credential requests. Treat it as tamper-sensitive.
 
-Trusted client environment:
+[Google documents `GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL` as present when
+service-account impersonation is used](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers#executable-sourced-credentials).
+Current Google Auth Python instead
+[constructs the source credential without the impersonation URL](https://github.com/googleapis/google-cloud-python/blob/f1213c311d6b8d96e46763cb0e3cff8b68f72f70/packages/google-auth/google/auth/external_account.py#L631-L638),
+then [injects the email only when that URL is present](https://github.com/googleapis/google-cloud-python/blob/f1213c311d6b8d96e46763cb0e3cff8b68f72f70/packages/google-auth/google/auth/pluggable.py#L348-L361).
+The executable therefore does not receive the email on Python's impersonated
+credential path. pivb validates the variable exactly when a client supplies it;
+when it is absent, pivb derives the target from the selected alias in its closed
+configuration. No manual email override is required.
 
-```bash
-export GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1
-export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/pivb/credentials/ro.json"
+Trusted non-gcloud client environment in Fish:
+
+```fish
+set -lx GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES 1
+set -lx GOOGLE_APPLICATION_CREDENTIALS "$HOME/.config/pivb/credentials/ro.json"
 ```
 
-For gcloud:
+For gcloud, use the credential-file override directly:
 
-```console
-gcloud auth login --cred-file="$HOME/.config/pivb/credentials/ro.json"
+```fish
+set -lx GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES 1
+set -lx CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE "$HOME/.config/pivb/credentials/ro.json"
 ```
 
 gcloud maintains its own access-token cache, so `~/.config/gcloud` is a credential
@@ -431,14 +442,15 @@ schedule more often than any other. A synthetic parser test proves nothing: test
 the production dependency graph with a real request, against the real provider,
 before removing the old credential path.
 
-```bash
-export GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1
-export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/pivb/credentials/ro.json"
-unset GCE_METADATA_HOST GCE_METADATA_IP GCE_METADATA_ROOT
+```fish
+set -lx GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES 1
+set -lx CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE "$HOME/.config/pivb/credentials/ro.json"
+set -e GCE_METADATA_HOST GCE_METADATA_IP GCE_METADATA_ROOT
 ```
 
-- **gcloud** — verify both `gcloud auth login --cred-file=<alias>.json` and the
-  credential-file override path your machine configuration actually uses.
+- **gcloud** — perform a real, permitted Google API request through the
+  credential-file override shown above. Do not set
+  `GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL` manually.
 - **The JVM backend**, with its real dependency tree. Old transitive
   `google-auth-library-oauth2-http` versions are the usual failure. If a deployed
   client cannot build the credential, **upgrade that client before cutover** —
@@ -449,14 +461,23 @@ unset GCE_METADATA_HOST GCE_METADATA_IP GCE_METADATA_ROOT
   A consumer that cannot construct ID-token credentials from executable-sourced WIF
   plus impersonation needs upgrading too.
 
-**Record the exact versions** of gcloud and every Google auth library you tested.
-That record is what later tells you whether a dependency bump is safe.
+**Record the exact versions** of gcloud and every Google auth library you tested,
+and whether each client supplied `GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL` to
+the executable. That record is what later tells you whether a dependency bump is
+safe.
 
 Then prove the boundary rather than assuming it:
 
-- Copy `ro.json`, edit the copy's impersonation URL to `deploy`'s target service
-  account, and use it. It must fail **at Google** (STS or IAM), not merely locally.
-  A local-only failure means the cloud-side controls are not carrying their weight.
+- Run the negative canary specifically through gcloud/Python: copy `ro.json`, edit
+  only the copy's impersonation URL to `deploy`'s target service account, point
+  `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE` at the copy, and make a request. Python
+  omits the email variable, so every local tripwire passes and pivb still signs the
+  configured `ro` alias/target pair. STS should accept that pair; IAM
+  `generateAccessToken` must then deny impersonation of `deploy`. Verify both
+  events in the Google audit logs.
+- A client that supplies the edited email will fail locally with `PIVB_ENV`. That
+  is useful defense in depth, but it does not test the Google-side cross-alias
+  boundary and is not a successful negative canary.
 - Confirm audit entries name the expected `sub`, `serial`, and `key_id` per card.
 - Mint with every card and confirm all of them work.
 
@@ -512,14 +533,21 @@ This is the executable credential source. Auth libraries invoke it; you normally
 not. It writes exactly one JSON document to stdout per invocation and puts operator
 detail — never token material — on stderr.
 
-Before contacting the signing socket it requires the environment the auth library
-sets: `GOOGLE_EXTERNAL_ACCOUNT_TOKEN_TYPE` equal to the OIDC ID-token type,
-`GOOGLE_EXTERNAL_ACCOUNT_AUDIENCE` equal to the derived external-account audience,
-`GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL` equal to the alias's configured
-target, and `GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE` absent. The daemon repeats all of
-these against its own configuration. These checks catch tampered, stale, or foreign
-credential files; the provider condition and IAM bindings remain the authoritative
-Google-side boundary.
+Before contacting the signing socket it requires
+`GOOGLE_EXTERNAL_ACCOUNT_TOKEN_TYPE` equal to the OIDC ID-token type and
+`GOOGLE_EXTERNAL_ACCOUNT_AUDIENCE` equal to the derived external-account audience.
+`GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL` is optional, but when supplied it
+must equal the alias's configured target; a present-empty value is a mismatch.
+`GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE` must be absent. The daemon request always
+uses the configured alias target and the daemon revalidates the alias, audience,
+and target against its own configuration.
+
+These local checks catch some tampered, stale, or foreign credential files, but
+Python clients never exercise the email tripwire on the service-account
+impersonation path. In particular, changing only the impersonation URL remains
+invisible to pivb under gcloud/Python. A local mismatch rejection therefore does
+not prove the cross-alias boundary; the provider condition and per-alias IAM
+bindings are authoritative, and the negative canary above must reach Google.
 
 Success, exit 0:
 
@@ -850,12 +878,14 @@ With the operator and enrolled hardware, verify:
    Google endpoint.
 6. `journalctl --user -u pivb.service` contains no PIN, subject token, STS token,
    access token, or Authorization header — under success and every tested failure.
-7. Cross-alias impersonation is denied at Google IAM: a credential file edited to
-   target another alias's service account fails at STS or IAM, not only locally.
+7. Through gcloud/Python, a credential file edited to target another alias's
+   service account succeeds at STS but is denied by IAM `generateAccessToken`, not
+   merely rejected locally.
 8. Remove one card's JWK, re-upload the remaining set, and confirm new exchanges
    with that card fail while other cards keep working.
 9. gcloud and the production JVM backend authenticate through the external-account
-   file with no metadata variables and no browser login.
+   file with no metadata variables, no browser login, and no manually supplied
+   impersonated-email variable.
 10. Generated credential files still work after a NixOS rebuild changes the pivb
     store path.
 11. Agent sandboxes pass every

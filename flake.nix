@@ -11,9 +11,10 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          version = "0.2.1";
           pivb = pkgs.buildGoModule {
             pname = "pivb";
-            version = "0.2.0";
+            inherit version;
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
               filter = path: type:
@@ -27,7 +28,7 @@
             ldflags = [
               "-s"
               "-w"
-              "-X github.com/xlfe/pivb/internal/version.Value=0.2.0"
+              "-X github.com/xlfe/pivb/internal/version.Value=${version}"
             ];
             postInstall = ''
               install -Dm644 systemd/pivb.service $out/lib/systemd/user/pivb.service

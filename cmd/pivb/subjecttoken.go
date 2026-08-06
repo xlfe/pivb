@@ -103,7 +103,7 @@ func subjectTokenCommand(configPath, wifSocket string, args []string, stdout, st
 		return report(wifapi.CodeEnv, "credential configuration audience does not match pivb configuration",
 			fmt.Sprintf("%s is %q but this host derives %q; regenerate with `pivb wif credentials`", envAudience, got, wantAudience))
 	}
-	if got := os.Getenv(envImpersonatedEmail); got != aliasCfg.Target {
+	if got, present := os.LookupEnv(envImpersonatedEmail); present && got != aliasCfg.Target {
 		return report(wifapi.CodeEnv, "credential configuration impersonation target does not match pivb configuration",
 			fmt.Sprintf("%s is %q but alias %q targets %q; regenerate with `pivb wif credentials`", envImpersonatedEmail, got, *alias, aliasCfg.Target))
 	}
