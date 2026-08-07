@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xlfe/pivb/internal/agentsource"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/pivsigner"
 	"github.com/xlfe/pivb/internal/wif"
@@ -36,6 +37,13 @@ type RequestMismatchError struct {
 	Want  string
 }
 
+// RequestSourceError rejects malformed trusted-host-asserted audit context
+// before it can reach a signing label, daemon log, or notification command.
+type RequestSourceError struct{ Err error }
+
+func (e *RequestSourceError) Error() string { return "invalid request source: " + e.Err.Error() }
+func (e *RequestSourceError) Unwrap() error { return e.Err }
+
 func (e *RequestMismatchError) Error() string {
 	return fmt.Sprintf("request %s %q does not match the configured value %q; regenerate the credential file with `pivb wif credentials`", e.Field, e.Got, e.Want)
 }
@@ -47,6 +55,7 @@ type SubjectTokenRequest struct {
 	Alias                   string
 	ExternalAccountAudience string
 	ImpersonatedEmail       string
+	RequestSource           agentsource.Source
 }
 
 type SubjectTokenResult struct {
@@ -137,6 +146,11 @@ func (c *Core) Lock() {
 // to the enrolled key observed in that session. The token is returned to the
 // caller and never retained or logged by the daemon.
 func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (SubjectTokenResult, error) {
+	source, _, err := agentsource.Validate(req.RequestSource, req.Alias)
+	if err != nil {
+		return SubjectTokenResult{}, &RequestSourceError{Err: err}
+	}
+	req.RequestSource = source
 	alias, ok := c.cfg.Aliases[req.Alias]
 	if !ok {
 		return SubjectTokenResult{}, &UnknownAliasError{Alias: req.Alias}
@@ -193,7 +207,7 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		return wif.SigningDigest(input), nil
 	}
 
-	label := req.Alias + " → " + alias.Target + " (local-wif)"
+	label := agentsource.SigningLabel(req.RequestSource, req.Alias, alias.Target)
 	sig, serial, err := c.signer.Sign(ctx, label, string(pin), digestFor)
 	c.recordPINVerification(serial, err)
 	if err != nil {

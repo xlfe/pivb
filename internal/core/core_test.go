@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xlfe/pivb/internal/agentsource"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/pivsigner"
 )
@@ -506,6 +507,35 @@ func TestSubjectTokenRejectsRequestsConfigurationDoesNotBind(t *testing.T) {
 	}
 	if status := c.Status(); status.LastSignAlias != "" || !status.LastSignAt.IsZero() {
 		t.Errorf("rejected requests recorded a signature: %#v", status)
+	}
+}
+
+func TestSubjectTokenValidatesAgentSourceBeforeHardware(t *testing.T) {
+	c, signer := newTestCore(t, testConfig("session"), serialA)
+	fixClock(c)
+	unlockOK(t, c, pinA)
+	before := signer.counts
+
+	bad := roRequest()
+	bad.RequestSource = agentsource.Agent("codex:agentic/deploy", "0123456789abcdef0123456789abcdef")
+	if _, err := c.SubjectToken(context.Background(), bad); err == nil {
+		t.Fatal("mismatched source role succeeded")
+	} else {
+		var sourceErr *RequestSourceError
+		if !errors.As(err, &sourceErr) {
+			t.Fatalf("error = %T %v, want RequestSourceError", err, err)
+		}
+	}
+	if signer.counts != before {
+		t.Fatalf("invalid source reached hardware: %+v != %+v", signer.counts, before)
+	}
+
+	good := roRequest()
+	good.RequestSource = agentsource.Agent("codex:agentic/ro", "0123456789abcdef0123456789abcdef")
+	mintOK(t, c, good)
+	want := "agent codex · project agentic · role ro\nsession 0123456789ab\ntarget " + roTarget
+	if got := signer.labels[len(signer.labels)-1]; got != want {
+		t.Fatalf("agent signing label = %q, want %q", got, want)
 	}
 }
 

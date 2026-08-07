@@ -14,6 +14,12 @@ import (
 // PIN handoff, the touch window, and one scdaemon retry.
 const ExecutableTimeoutMillis = 30000
 
+const (
+	AgentSandboxRoot       = "/run/pivb-agent"
+	AgentSessionSocketPath = AgentSandboxRoot + "/session.sock"
+	AgentHelperPath        = AgentSandboxRoot + "/pivb-agent-subject-token"
+)
+
 // CredentialFileSpec describes one per-alias external-account credential
 // file. All values come from validated configuration; the generator never
 // accepts a caller-supplied impersonation URL.
@@ -23,6 +29,15 @@ type CredentialFileSpec struct {
 	Target          string
 	LifetimeSeconds int
 	Executable      string
+}
+
+// AgentCredentialFileSpec describes the fixed-alias credential generated for
+// one ephemeral agent session. The executable and socket paths are a fixed
+// sandbox ABI and neither carries an alias selector.
+type AgentCredentialFileSpec struct {
+	Provider        Provider
+	Target          string
+	LifetimeSeconds int
 }
 
 type executableSource struct {
@@ -61,26 +76,42 @@ func CredentialFile(spec CredentialFileSpec) ([]byte, error) {
 	if strings.ContainsFunc(spec.Alias, func(r rune) bool { return r <= 0x20 || r == 0x7f }) {
 		return nil, fmt.Errorf("credential alias %q must not contain whitespace or control characters", spec.Alias)
 	}
-	if spec.LifetimeSeconds < 600 || spec.LifetimeSeconds > 3600 {
-		return nil, fmt.Errorf("credential lifetime %ds is outside the supported 600..3600 range", spec.LifetimeSeconds)
-	}
 	if err := ValidateExecutablePath(spec.Executable); err != nil {
 		return nil, err
 	}
-	if spec.Provider.ProjectNumber == "" || spec.Provider.PoolID == "" || spec.Provider.ProviderID == "" {
+	return credentialFileDocument(spec.Provider, spec.Target, spec.LifetimeSeconds,
+		spec.Executable+" subject-token --alias "+spec.Alias)
+}
+
+// AgentCredentialFile renders the external-account JSON placed into one
+// agent-session directory. The helper can reach only the fixed relay socket;
+// alias and source identity never appear in its command line.
+func AgentCredentialFile(spec AgentCredentialFileSpec) ([]byte, error) {
+	if spec.Target == "" {
+		return nil, errors.New("agent credential target is required")
+	}
+	return credentialFileDocument(spec.Provider, spec.Target, spec.LifetimeSeconds,
+		AgentHelperPath+" --socket "+AgentSessionSocketPath)
+}
+
+func credentialFileDocument(provider Provider, target string, lifetimeSeconds int, command string) ([]byte, error) {
+	if lifetimeSeconds < 600 || lifetimeSeconds > 3600 {
+		return nil, fmt.Errorf("credential lifetime %ds is outside the supported 600..3600 range", lifetimeSeconds)
+	}
+	if provider.ProjectNumber == "" || provider.PoolID == "" || provider.ProviderID == "" {
 		return nil, errors.New("wif provider is incompletely configured")
 	}
 	doc := credentialFile{
 		Type:             "external_account",
-		Audience:         spec.Provider.ExternalAccountAudience(),
+		Audience:         provider.ExternalAccountAudience(),
 		SubjectTokenType: TokenType,
 		TokenURL:         "https://sts.googleapis.com/v1/token",
 		ServiceAccountImpersonationURL: "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" +
-			url.PathEscape(spec.Target) + ":generateAccessToken",
-		ServiceAccountImpersonation: impersonation{TokenLifetimeSeconds: spec.LifetimeSeconds},
+			url.PathEscape(target) + ":generateAccessToken",
+		ServiceAccountImpersonation: impersonation{TokenLifetimeSeconds: lifetimeSeconds},
 		CredentialSource: credentialSource{
 			Executable: executableSource{
-				Command:       spec.Executable + " subject-token --alias " + spec.Alias,
+				Command:       command,
 				TimeoutMillis: ExecutableTimeoutMillis,
 			},
 		},

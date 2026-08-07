@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xlfe/pivb/internal/tokenapi"
 	"github.com/xlfe/pivb/internal/uds"
 )
 
@@ -26,20 +27,13 @@ func NewClient(socket string) *Client {
 	return &Client{HTTP: uds.NewHTTPClient(socket, clientTimeout)}
 }
 
-// APIError is a structured daemon rejection with a stable code.
-type APIError struct {
-	Status  int
-	Code    string
-	Message string
-	Remedy  string
+// NewClientWithTimeout is used by the fixed-alias relay so its upstream
+// deadline expires before the outer executable helper's deadline.
+func NewClientWithTimeout(socket string, timeout time.Duration) *Client {
+	return &Client{HTTP: uds.NewHTTPClient(socket, timeout)}
 }
 
-func (e *APIError) Error() string {
-	if e.Remedy != "" {
-		return fmt.Sprintf("pivb daemon %s: %s (remedy: %s)", e.Code, e.Message, e.Remedy)
-	}
-	return fmt.Sprintf("pivb daemon %s: %s", e.Code, e.Message)
-}
+type APIError = tokenapi.APIError
 
 func (c *Client) SubjectToken(ctx context.Context, req SubjectTokenRequest) (SubjectTokenResponse, error) {
 	var out SubjectTokenResponse

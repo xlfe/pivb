@@ -34,6 +34,11 @@ UID.** Every unsandboxed process in your user session is inside the trust bounda
 Agent sandboxes must be excluded by mount and network isolation, not by this check —
 see [Agent sandboxes](#agent-sandboxes).
 
+A trusted launcher may create one additional, ephemeral `0600` socket with
+`pivb agent-session`. That relay has one fixed alias and no alias-selection field;
+mounting that one socket is the delegated capability. It is owned by the
+supervisor process, not pivbd, and disappears with the supervised launcher.
+
 ### What this design guarantees
 
 1. No pivb TCP listener exists, on loopback or any other interface.
@@ -51,10 +56,11 @@ see [Agent sandboxes](#agent-sandboxes).
    and no exportable private key is introduced.
 
 One further property depends on the machine configuration rather than on this
-repository: agent sandboxes cannot request a signature, reach an issued
-credential, drive the YubiKey directly, or escape to a host process that can —
-provided the [sandbox contract](#agent-sandboxes) is deployed. Until it is, the
-[interim operating rule](#interim-operating-rule) applies.
+repository: an agent sandbox can reach only the single explicitly delegated
+agent-session socket, cannot reach raw pivb or the YubiKey, and cannot escape to a
+host process that can — provided the [sandbox contract](#agent-sandboxes) is
+deployed. Until its complete production-launcher suite passes, the [interim
+operating rule](#interim-operating-rule) applies.
 
 **Out of scope:** kernel or root compromise, physical attacks on the YubiKey,
 revoking an already-issued Google access token (Google has no API for it), AWS and
@@ -84,12 +90,14 @@ nix build
 nix develop --command go test ./...
 ```
 
-The flake builds with cgo against `pcsclite` and installs the user unit at
-`lib/systemd/user/pivb.service`. Go dependencies are vendored so the build is
-network-independent. For a local development build inside `nix develop`:
+The flake builds `pivb` with cgo against `pcsclite`, builds
+`pivb-agent-subject-token` separately with `CGO_ENABLED=0` as a fully static
+executable, and installs the user unit at `lib/systemd/user/pivb.service`. Go
+dependencies are vendored so the build is network-independent. For a local
+development build inside `nix develop`:
 
 ```console
-go build ./cmd/pivb
+go build ./cmd/pivb ./cmd/pivb-agent-subject-token
 ```
 
 ## Configure
@@ -574,6 +582,61 @@ Stable codes:
 | `PIVB_INTERNAL` | malformed daemon response or an unclassified daemon error |
 | `PIVB_PEER` | the socket peer's real UID is not the daemon's — surfaced from the UDS layer |
 
+### `pivb agent-session`
+
+This trusted-host supervisor delegates exactly one configured alias to one outer
+sandbox launcher:
+
+```fish
+pivb agent-session \
+  --alias ro \
+  --source-label codex:agentic/ro \
+  -- agent-sandbox-launcher codex
+```
+
+The source label grammar is `<agent>:<project>/<role>`, with 1–32 lowercase ASCII
+letters, digits, dots, underscores, or hyphens per component; each component starts
+with a letter, and `role` must equal `--alias`. The label and session ID are bounded
+operator context, not authorization. Any same-UID host process that already reaches
+`wif.sock` can spoof them; the host socket is trusted-host-only for that reason.
+
+Before starting the child, the supervisor resolves the alias, target, WIF audience,
+and access-token lifetime from the closed config. It creates a unique `0700`
+directory below `$XDG_RUNTIME_DIR/pivb-agent`, containing `session.sock`,
+`credential.json`, and `session.json` as `0600`, then gives the launcher
+`PIVB_AGENT_SESSION_DIR` and `PIVB_AGENT_SESSION_ID`. `session.json` contains the
+non-secret session ID, creation time, alias, target, audience, lifetime, and source
+label.
+
+The child stays in the supervisor's foreground process group, so interactive Codex
+and Claude TUIs retain normal terminal job control. The supervisor forwards
+targeted `SIGHUP` and `SIGTERM`, escalating a repeated signal to `SIGKILL`,
+propagates the child's exit status or fatal signal, and removes the session
+directory before it exits. Terminal `SIGINT` and `SIGQUIT` already reach the whole
+foreground process group and are not sent to the child a second time; service
+managers and targeted lifecycle controls must use `SIGTERM`. If the relay itself
+fails, the supervisor terminates the child because the session contract is no
+longer usable. Cleanup errors are reported but never replace the child's exit
+status.
+
+Inside the sandbox, the generated credential invokes only the fully static helper:
+
+```text
+/run/pivb-agent/pivb-agent-subject-token --socket /run/pivb-agent/session.sock
+```
+
+That helper loads no PIVB config and has no control, PC/SC, YubiKey, STS, IAM
+Credentials, or alias-selection capability. The relay request contains only the
+executable audience and optional impersonated email for validation. It injects the
+captured alias, target, audience, source label, and session ID into the ordinary WIF
+request; pivbd revalidates all authorization values and validates the audit context
+before it can enter logs or a touch notification. A daemon restart reconnects on a
+later request or returns `PIVB_UNAVAILABLE`; it never falls back to broader access.
+
+The socket intentionally allows repeated subject-token mints until the supervised
+child exits. Removing it prevents new mints but cannot revoke Google credentials
+already obtained by an auth library; those expire within the configured lifetime.
+
 ### Subject token
 
 Each token is an RS256 compact JWS with `kid` bound to the enrolled key:
@@ -679,9 +742,10 @@ while valid host clients keep working.
   cannot reliably erase the string copies the PIN makes crossing API and signer
   boundaries, so process-memory compromise during an unlock or mint remains in
   the threat model.
-- Touch notifications name the alias, target, and the `local-wif` request source.
-  They are operator context, not authorization: a touch does not make a request
-  legitimate, which is why agents must not reach the signing socket at all.
+- Touch notifications name the alias and target. Trusted-host requests retain the
+  `local-wif` label; delegated requests show the structured source label and first
+  12 session-ID characters, while logs and `session.json` retain the full ID. This
+  is operator context, not authorization: raw `wif.sock` remains trusted-host-only.
 - A subject token minted for one alias cannot impersonate another alias's target,
   even if copied before expiry — the alias/target claims, the provider condition,
   and the per-target binding all have to agree.
@@ -701,38 +765,45 @@ slot `83`.
 
 ## Agent sandboxes
 
-**pivb must be unavailable inside Claude, Codex, and other agent sandboxes** — the
-capability, not just the command name. A sandboxed agent running as your host UID
-passes the `SO_PEERCRED` check if it can see the socket, so the boundary has to be
-the mount and network namespace.
+**Raw PIVB, the YubiKey, configuration, and ordinary sockets must remain
+unavailable. A sandbox may receive one explicitly delegated, fixed-alias
+agent-session socket after the complete sandbox acceptance suite passes.**
 
-This is what makes the central security claim true. Everything else in this design
-reduces what pivb can be tricked into doing; this boundary is what stops an
-untrusted process asking in the first place, and Google is explicit that any
-process able to run the credential executable receives the credential on stdout.
-It is load-bearing, not defense in depth.
+The machine configuration owns this boundary, not PIVB or the products' inner
+command sandboxes. A same-UID agent passes `SO_PEERCRED` on any socket it can see;
+hiding the `pivb` binary is therefore cosmetic. Apply the outer-launcher contract
+to every Claude and Codex entry point, including fresh, resumed, nested-tool, and
+alternate wrappers. The [Codex sandbox](https://learn.chatgpt.com/docs/sandboxing)
+and [Claude Code Bash sandbox](https://code.claude.com/docs/en/sandboxing) constrain
+spawned commands and their subprocesses; the outer launcher remains responsible
+for which host Unix capabilities enter that boundary.
 
-Hiding the `pivb` binary does not achieve it. A direct UDS client, PC/SC, a
-forwarded file descriptor, the user systemd bus, or a host-side proxy each bypass
-that cosmetic control. The capability must be absent, not merely inconvenient.
+The launcher consumes `PIVB_AGENT_SESSION_DIR` only on the host. It creates a
+private read-only `/run/pivb-agent` and binds exactly these paths:
 
-The machine configuration owns this boundary, not this repository. Apply the same
-contract to **every** Claude and Codex launcher, including alternate wrappers and
-resumed sessions — a single unhardened launcher is the whole boundary.
+| Host source | Sandbox destination |
+|---|---|
+| `$PIVB_AGENT_SESSION_DIR/session.sock` | `/run/pivb-agent/session.sock` |
+| `$PIVB_AGENT_SESSION_DIR/credential.json` | `/run/pivb-agent/credential.json` |
+| `$PIVB_AGENT_SESSION_DIR/session.json` | `/run/pivb-agent/session.json` |
+| dereferenced installed `pivb-agent-subject-token` | `/run/pivb-agent/pivb-agent-subject-token` |
+
+Read-only bind mounts do not prevent `connect(2)` to the `0600` socket. Do not bind
+the helper's parent Nix output or `/run/current-system`; resolve the installed
+symlink on the host and bind only the static executable file.
 
 ### Mount and device namespace
 
-- Start from an empty private `/run`; bind only what the sandboxed workload needs.
+- Start from an empty private `/run`; add only the four paths above and unrelated
+  paths the workload genuinely needs.
 - Never bind `$XDG_RUNTIME_DIR/pivb`, `/run/pcscd`, `/dev/bus/usb`, any YubiKey
   device node, the user D-Bus or systemd sockets, Docker/Podman sockets, SSH or GPG
   agent sockets, or a forwarded pivb file descriptor.
 - Use a minimal private `/dev` with no raw USB and no smart-card devices.
-- Hide `~/.config/pivb`, the generated credential files, `~/.config/gcloud`, ADC
-  files, and any application-specific credential cache.
-- Do not expose `/run/current-system` wholesale. Build the sandbox package closure
-  explicitly and omit pivb. If the whole Nix store is otherwise visible, expose only
-  the closures the sandbox requires — otherwise a pivb store output can be invoked
-  by hash.
+- Hide `~/.config/pivb`, ordinary generated credential files, `~/.config/gcloud`,
+  ADC files, and every application-specific credential cache.
+- Do not expose `/run/current-system` or the Nix store wholesale. Build the sandbox
+  package closure explicitly and omit raw pivb.
 - Use a private PID namespace and proc mount, so a same-UID agent cannot inspect or
   signal host user processes.
 
@@ -767,7 +838,20 @@ DBUS_SESSION_BUS_ADDRESS
 DOCKER_HOST
 SSH_AUTH_SOCK
 GPG_AGENT_INFO
+PIVB_AGENT_SESSION_DIR
 ```
+
+After scrubbing inherited credential selection, set exactly:
+
+```fish
+set -gx GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES 1
+set -gx GOOGLE_APPLICATION_CREDENTIALS /run/pivb-agent/credential.json
+set -gx CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE /run/pivb-agent/credential.json
+```
+
+The non-secret `PIVB_AGENT_SESSION_ID` may remain for correlation. A nested launcher
+must reuse the inherited `/run/pivb-agent` or refuse to start; it must never replace
+the session by reaching a host-side launcher or creating a new delegation.
 
 Also block `systemd-run --user`, the host user manager, container-daemon sockets,
 `nsenter` targets, and any helper that can spawn a process outside the sandbox. A
@@ -780,27 +864,41 @@ Run these **from inside the real production launcher** — a unit test of the Ni
 expression is not enough — while pivb has a cached PIN, a YubiKey is inserted, and
 a trusted host client can successfully authenticate:
 
-1. `command -v pivb` fails.
-2. Neither pivb socket path exists.
-3. Connecting to host `127.0.0.1`, `::1`, the user-mode-network gateway, and the
+1. The `ro` session authenticates through both gcloud and a real ADC client with
+   `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`; no browser login is involved.
+2. A cache miss produces a YubiKey signature and the touch prompt contains the
+   source, short session ID, and fixed target without token material.
+3. Raw requests carrying an alias or attempting `deploy` fail before signing.
+4. Tampered audience and supplied impersonation targets fail locally; an edited
+   impersonation URL whose client omits the email still fails through signed claims,
+   the provider condition, and per-alias IAM binding.
+5. Two concurrent sessions for different aliases cannot cross-select or cross-use
+   their sockets.
+6. The helper runs with no config, PIVB CLI, PC/SC, YubiKey, gcloud cache, or
+   ordinary credential file visible.
+7. `command -v pivb` fails; neither `$XDG_RUNTIME_DIR/pivb` nor any control,
+   discovery, configuration, STS, IAM Credentials, or access-token endpoint exists.
+8. Interrupting, killing, or crashing the child removes its three generated
+   artifacts; child exit codes and fatal signals propagate after cleanup.
+9. Connecting to host `127.0.0.1`, `::1`, the user-mode-network gateway, and the
    host LAN address reaches no host service.
-4. `/run/pcscd/pcscd.comm` and `/dev/bus/usb` are absent.
-5. PC/SC enumeration and direct YubiKey access fail.
-6. pivb config, ADC, generated credential files, and gcloud stores are unreadable.
-7. The user D-Bus/systemd manager and Docker/Podman/SSH/GPG agent sockets are absent.
-8. `systemd-run --user`, `nsenter`, inherited file-descriptor, and host-proxy bypass
-   attempts all fail.
-9. DNS and approved HTTPS still work, if Internet access is part of the contract.
-10. All of the above pass for **fresh, resumed, nested-tool, and alternate CLI
-    launcher** paths, for both agent products.
+10. `/run/pcscd`, USB, D-Bus/systemd, Docker/Podman, SSH/GPG, `systemd-run --user`,
+    `nsenter`, inherited descriptors, and host-proxy bypass attempts all fail while
+    approved DNS/HTTPS still work.
+11. Existing trusted-host subject-token credentials remain compatible, and agent
+    logs/notifications identify the full source/session without logging secrets.
+12. A daemon restart either reconnects on a later request or yields the structured
+    `PIVB_UNAVAILABLE` response; it never widens or falls back. Run all tests for
+    fresh, resumed, nested-tool, and alternate launchers for both agent products.
 
 ### Interim operating rule
 
-Until that boundary is deployed and its tests pass, the honest position is that a
-sandboxed agent running as your UID can reach the signing socket. Therefore: **do
-not run an untrusted agent sandbox while the pivb service is running.**
+Until the production launcher implements the four-path bind and every acceptance
+test above passes, the honest position is unchanged: **do not run an untrusted
+agent sandbox while the pivb service is running.** Do not treat the presence of
+`agent-session` alone as permission to relax this rule.
 
-```console
+```fish
 systemctl --user stop pivb.service
 systemctl --user mask pivb.service      # unmask when you need pivb again
 ```
@@ -888,9 +986,9 @@ With the operator and enrolled hardware, verify:
    impersonated-email variable.
 10. Generated credential files still work after a NixOS rebuild changes the pivb
     store path.
-11. Agent sandboxes pass every
-    [sandbox acceptance test](#sandbox-acceptance-tests) while approved DNS and
-    HTTPS keep working.
+11. Fixed-alias agent sessions pass every [sandbox acceptance
+    test](#sandbox-acceptance-tests), including real gcloud/ADC authentication,
+    while raw PIVB and host capabilities remain unreachable.
 12. Every target access token expires within 3600 seconds.
 13. Old broker uploaded keys, Token Creator grants, and broker service accounts are
     absent after the rollback window.

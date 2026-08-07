@@ -2,65 +2,41 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/xlfe/pivb/internal/config"
-	"github.com/xlfe/pivb/internal/wif"
+	"github.com/xlfe/pivb/internal/execsource"
 	"github.com/xlfe/pivb/internal/wifapi"
 )
 
 // errReported signals that subject-token already wrote its machine-readable
 // error document to stdout; main must exit nonzero without printing more.
-var errReported = errors.New("subject-token error already reported on stdout")
+var errReported = execsource.ErrReported
 
 // Environment variables set by Google auth libraries when invoking an
 // executable credential source. (The libraries additionally require
 // GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1 in the client environment;
 // that check is theirs, not ours.)
 const (
-	envTokenType         = "GOOGLE_EXTERNAL_ACCOUNT_TOKEN_TYPE"
-	envAudience          = "GOOGLE_EXTERNAL_ACCOUNT_AUDIENCE"
-	envImpersonatedEmail = "GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL"
-	envOutputFile        = "GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE"
+	envTokenType         = execsource.EnvTokenType
+	envAudience          = execsource.EnvAudience
+	envImpersonatedEmail = execsource.EnvImpersonatedEmail
+	envOutputFile        = execsource.EnvOutputFile
 )
 
 const subjectTokenTimeout = 28 * time.Second
-
-type executableSuccess struct {
-	Version        int    `json:"version"`
-	Success        bool   `json:"success"`
-	TokenType      string `json:"token_type"`
-	IDToken        string `json:"id_token"`
-	ExpirationTime int64  `json:"expiration_time"`
-}
-
-type executableError struct {
-	Version int    `json:"version"`
-	Success bool   `json:"success"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
 
 // subjectTokenCommand implements the executable credential-source protocol.
 // stdout carries exactly one JSON document per invocation; operator detail
 // goes to stderr and never includes token material.
 func subjectTokenCommand(configPath, wifSocket string, args []string, stdout, stderr io.Writer) error {
 	report := func(code, message, detail string) error {
-		if detail != "" {
-			fmt.Fprintln(stderr, "pivb subject-token:", detail)
-		}
-		enc := json.NewEncoder(stdout)
-		if err := enc.Encode(executableError{Version: 1, Success: false, Code: code, Message: message}); err != nil {
-			return fmt.Errorf("write executable error document: %w", err)
-		}
-		return errReported
+		return execsource.Report(stdout, stderr, "pivb subject-token", code, message, detail)
 	}
 
 	fs := flag.NewFlagSet("subject-token", flag.ContinueOnError)
@@ -95,21 +71,27 @@ func subjectTokenCommand(configPath, wifSocket string, args []string, stdout, st
 	// checks; Google's provider condition and IAM bindings remain the
 	// authoritative boundary.
 	wantAudience := cfg.Provider().ExternalAccountAudience()
-	if got := os.Getenv(envTokenType); got != wif.TokenType {
-		return report(wifapi.CodeEnv, "credential configuration requests an unsupported subject token type",
-			fmt.Sprintf("%s is %q; pivb only issues %q (invoke pivb through a Google auth library credential source)", envTokenType, got, wif.TokenType))
+	env, err := execsource.ReadEnvironment()
+	if err != nil {
+		message := "credential configuration requests an unsupported subject token type"
+		var envErr *execsource.EnvironmentError
+		if errors.As(err, &envErr) {
+			switch envErr.Field {
+			case envOutputFile:
+				message = "subject-token output caching is prohibited"
+			case envAudience:
+				message = "credential configuration audience is missing"
+			}
+		}
+		return report(wifapi.CodeEnv, message, err.Error()+" (invoke pivb through a Google auth library credential source)")
 	}
-	if got := os.Getenv(envAudience); got != wantAudience {
+	if got := env.Audience; got != wantAudience {
 		return report(wifapi.CodeEnv, "credential configuration audience does not match pivb configuration",
 			fmt.Sprintf("%s is %q but this host derives %q; regenerate with `pivb wif credentials`", envAudience, got, wantAudience))
 	}
-	if got, present := os.LookupEnv(envImpersonatedEmail); present && got != aliasCfg.Target {
+	if env.ImpersonatedEmail != nil && *env.ImpersonatedEmail != aliasCfg.Target {
 		return report(wifapi.CodeEnv, "credential configuration impersonation target does not match pivb configuration",
-			fmt.Sprintf("%s is %q but alias %q targets %q; regenerate with `pivb wif credentials`", envImpersonatedEmail, got, *alias, aliasCfg.Target))
-	}
-	if got := os.Getenv(envOutputFile); got != "" {
-		return report(wifapi.CodeEnv, "subject-token output caching is prohibited",
-			fmt.Sprintf("%s is set to %q; remove output_file from the credential configuration", envOutputFile, got))
+			fmt.Sprintf("%s is %q but alias %q targets %q; regenerate with `pivb wif credentials`", envImpersonatedEmail, *env.ImpersonatedEmail, *alias, aliasCfg.Target))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), subjectTokenTimeout)
@@ -137,13 +119,7 @@ func subjectTokenCommand(configPath, wifSocket string, args []string, stdout, st
 		return report(wifapi.CodeInternal, "daemon returned a malformed subject token", "")
 	}
 
-	if err := json.NewEncoder(stdout).Encode(executableSuccess{
-		Version:        1,
-		Success:        true,
-		TokenType:      wif.TokenType,
-		IDToken:        resp.IDToken,
-		ExpirationTime: resp.ExpirationTime,
-	}); err != nil {
+	if err := execsource.WriteSuccess(stdout, resp.IDToken, resp.ExpirationTime); err != nil {
 		return fmt.Errorf("write executable success document: %w", err)
 	}
 	return nil

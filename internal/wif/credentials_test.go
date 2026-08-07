@@ -100,6 +100,29 @@ func TestCredentialFileGolden(t *testing.T) {
 	}
 }
 
+func TestAgentCredentialFileUsesFixedAliasFreeHelper(t *testing.T) {
+	raw, err := wif.AgentCredentialFile(wif.AgentCredentialFileSpec{
+		Provider: testProvider, Target: testTarget, LifetimeSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got credentialDoc
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := wif.AgentHelperPath + " --socket " + wif.AgentSessionSocketPath
+	if got.CredentialSource.Executable.Command != want {
+		t.Fatalf("command = %q, want %q", got.CredentialSource.Executable.Command, want)
+	}
+	if strings.Contains(got.CredentialSource.Executable.Command, "--alias") {
+		t.Fatalf("agent command carries alias selection: %q", got.CredentialSource.Executable.Command)
+	}
+	if got.ServiceAccountImpersonation.TokenLifetimeSeconds != 1800 {
+		t.Fatalf("lifetime = %d, want 1800", got.ServiceAccountImpersonation.TokenLifetimeSeconds)
+	}
+}
+
 func TestCredentialFileEscapesTargetSegment(t *testing.T) {
 	// A target carrying separators must stay inside one path segment rather
 	// than redirecting the impersonation call to another resource.

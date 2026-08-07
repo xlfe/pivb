@@ -15,6 +15,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/xlfe/pivb/internal/agentapi"
+	"github.com/xlfe/pivb/internal/agentsession"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/pivsigner"
@@ -25,6 +26,10 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var childExit *agentsession.ChildExitError
+		if errors.As(err, &childExit) {
+			propagateChildExit(childExit)
+		}
 		if errors.Is(err, errReported) {
 			// subject-token already wrote its machine-readable error to stdout.
 			os.Exit(1)
@@ -71,6 +76,8 @@ func run(args []string) error {
 		// Machine interface: every outcome is reported as protocol JSON on
 		// stdout, including environment and configuration failures.
 		return subjectTokenCommand(*configPath, *wifSocket, rest, os.Stdout, os.Stderr)
+	case "agent-session":
+		return agentSessionCommand(*configPath, *wifSocket, rest)
 	case "wif":
 		return wifCommand(*configPath, rest)
 	}
@@ -175,6 +182,7 @@ func usage(fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), "  lock                                     drop the cached PIN and signing metadata")
 	fmt.Fprintln(fs.Output(), "  status [--watch d] [--format json|waybar]     card-free daemon status")
 	fmt.Fprintln(fs.Output(), "  subject-token --alias <alias>            executable credential source (machine interface)")
+	fmt.Fprintln(fs.Output(), "  agent-session --alias <a> --source-label <agent>:<project>/<role> -- <command> [args...]")
 	fmt.Fprintln(fs.Output(), "  wif jwks --cert <serial>=<pem> ...       build the uploaded JWKS from enrolled certificates")
 	fmt.Fprintln(fs.Output(), "  wif credentials --alias <a> --output <f> --executable <p>   write one credential file")
 	fmt.Fprintln(fs.Output(), "  wif provider-condition                   print provider mapping and condition for gcloud")

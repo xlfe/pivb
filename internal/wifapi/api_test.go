@@ -134,6 +134,18 @@ func TestSubjectTokenForwardsRequestVerbatim(t *testing.T) {
 	}
 }
 
+func TestSubjectTokenForwardsAgentSourceContext(t *testing.T) {
+	fake := okCore()
+	body := `{"alias":"ro","external_account_audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pivb-pool/providers/pivb-provider","impersonated_email":"readonly-sa@example-project-id.iam.gserviceaccount.com","request_source":{"kind":"agent-session","label":"codex:agentic/ro","session_id":"0123456789abcdef0123456789abcdef"}}`
+	rec := post(t, quietAPI(fake).Handler(), body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if fake.got.RequestSource.Kind != "agent-session" || fake.got.RequestSource.Label != "codex:agentic/ro" || fake.got.RequestSource.SessionID == "" {
+		t.Fatalf("core source = %+v", fake.got.RequestSource)
+	}
+}
+
 func TestSubjectTokenErrorMapping(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -170,6 +182,12 @@ func TestSubjectTokenErrorMapping(t *testing.T) {
 			name:       "request mismatch",
 			err:        &core.RequestMismatchError{Field: "external_account_audience", Got: "bad", Want: "good"},
 			wantStatus: http.StatusForbidden,
+			wantCode:   CodeConfig,
+		},
+		{
+			name:       "invalid request source",
+			err:        &core.RequestSourceError{Err: errors.New("unsafe label")},
+			wantStatus: http.StatusBadRequest,
 			wantCode:   CodeConfig,
 		},
 		{
@@ -305,13 +323,32 @@ func TestTokenNeverLogged(t *testing.T) {
 	if strings.Contains(logged, testToken) {
 		t.Errorf("log contains the minted token %q: %s", testToken, logged)
 	}
-	for _, want := range []string{"alias=ro", "serial=12345678", "key_id=kid"} {
+	for _, want := range []string{"alias=ro", "target=readonly-sa@example-project-id.iam.gserviceaccount.com", "source_kind=local-wif", "serial=12345678", "key_id=kid"} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("log is missing %q: %s", want, logged)
 		}
 	}
 	if !strings.Contains(rec.Body.String(), testToken) {
 		t.Errorf("response body = %q, want it to carry the token", rec.Body.String())
+	}
+}
+
+func TestAgentSourceLoggedWithoutToken(t *testing.T) {
+	var buf bytes.Buffer
+	api := &API{Core: okCore(), Logger: slog.New(slog.NewTextHandler(&buf, nil))}
+	body := `{"alias":"ro","external_account_audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pivb-pool/providers/pivb-provider","impersonated_email":"readonly-sa@example-project-id.iam.gserviceaccount.com","request_source":{"kind":"agent-session","label":"codex:agentic/ro","session_id":"0123456789abcdef0123456789abcdef"}}`
+	rec := post(t, api.Handler(), body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	logged := buf.String()
+	for _, want := range []string{"source_kind=agent-session", "source_label=codex:agentic/ro", "session_id=0123456789abcdef0123456789abcdef"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log missing %q: %s", want, logged)
+		}
+	}
+	if strings.Contains(logged, testToken) {
+		t.Fatalf("agent log contains token: %s", logged)
 	}
 }
 

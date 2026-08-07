@@ -138,6 +138,92 @@ func TestServeCreatesMissingRuntimeDir(t *testing.T) {
 	}
 }
 
+func TestServeListenerRequestCancellationIsOptIn(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		cancelRequests bool
+	}{
+		{"daemon graceful shutdown", false},
+		{"agent session cancellation", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp("/tmp", "pivb-uds-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "session.sock")
+			listener, err := Listen(socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			requestCanceled := make(chan bool, 1)
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(entered)
+				select {
+				case <-r.Context().Done():
+					requestCanceled <- true
+				case <-release:
+					requestCanceled <- false
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			serveDone := make(chan error, 1)
+			go func() {
+				if tt.cancelRequests {
+					serveDone <- ServeListenerCancelRequests(ctx, listener, handler)
+				} else {
+					serveDone <- ServeListener(ctx, listener, handler)
+				}
+			}()
+			requestDone := make(chan error, 1)
+			go func() {
+				resp, err := NewHTTPClient(socket, 2*time.Second).Get("http://pivb/test")
+				if err == nil {
+					resp.Body.Close()
+				}
+				requestDone <- err
+			}()
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("request did not reach handler")
+			}
+			cancel()
+
+			if tt.cancelRequests {
+				select {
+				case got := <-requestCanceled:
+					if !got {
+						t.Fatal("agent request completed without context cancellation")
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("agent request context was not cancelled")
+				}
+			} else {
+				select {
+				case got := <-requestCanceled:
+					t.Fatalf("daemon request ended early; cancelled = %v", got)
+				case <-time.After(50 * time.Millisecond):
+				}
+				close(release)
+				if got := <-requestCanceled; got {
+					t.Fatal("daemon request context was cancelled")
+				}
+			}
+			if err := <-requestDone; err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			if err := <-serveDone; err != nil {
+				t.Fatalf("serve failed: %v", err)
+			}
+		})
+	}
+}
+
 func TestServeFailsOnUnusableRuntimeDir(t *testing.T) {
 	blocker := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(blocker, nil, 0o600); err != nil {

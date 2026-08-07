@@ -345,6 +345,12 @@ func TestSubjectTokenEnvRejections(t *testing.T) {
 			wantStderr: "remove output_file",
 		},
 		{
+			name:       "output file present empty",
+			args:       []string{"--alias", "ro"},
+			env:        envWith(func(env map[string]string) { env[envOutputFile] = "" }),
+			wantStderr: "remove output_file",
+		},
+		{
 			name:       "no socket",
 			args:       []string{"--alias", "ro"},
 			env:        pythonSubjectTokenEnv(),
