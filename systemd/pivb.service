@@ -1,15 +1,15 @@
 [Unit]
 Description=YubiKey PIV Workload Identity Federation signer
 Documentation=https://github.com/xlfe/pivb
-After=graphical-session.target
+After=graphical-session.target zkad.service
 
 [Service]
 Type=simple
-ExecStart=@pivb@ serve
+ExecStart=@pivb@ --forward-socket=%t/pivb/forward.sock --card-lease-socket=%t/zka/card-lease.sock serve
 Restart=on-failure
 RestartSec=2s
 
-# pivbd is a networkless signer: it serves two Unix sockets under
+# pivbd is a networkless signer: it serves three Unix sockets under
 # $XDG_RUNTIME_DIR/pivb and reaches only /run/pcscd/pcscd.comm, gpgconf, and
 # the session bus for notifications. PrivateNetwork is the primary network
 # boundary; everything else reduces ambient surface. Verify the effective

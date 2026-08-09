@@ -101,6 +101,10 @@
         in {
           default = pkgs.mkShell {
             packages = [ pkgs.go pkgs.pkg-config pkgs.pcsclite pkgs.shellcheck ];
+            shellHook = ''
+              # Keep fixture Unix sockets below Linux's 108-byte path limit.
+              export TMPDIR=/tmp
+            '';
           };
         });
     };

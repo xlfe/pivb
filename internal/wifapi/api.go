@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 
 	"github.com/xlfe/pivb/internal/agentsource"
 	"github.com/xlfe/pivb/internal/core"
@@ -40,6 +41,9 @@ type SubjectTokenRequest struct {
 	ExternalAccountAudience string              `json:"external_account_audience"`
 	ImpersonatedEmail       string              `json:"impersonated_email"`
 	RequestSource           *agentsource.Source `json:"request_source,omitempty"`
+	// RouteSocket is accepted only on the trusted-host wif.sock. The fixed
+	// agent-session relay injects it; the sandbox request has no such field.
+	RouteSocket string `json:"route_socket,omitempty"`
 }
 
 type SubjectTokenResponse = tokenapi.SubjectTokenResponse
@@ -67,6 +71,10 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), CodeConfig, "send the fixed subject-token request shape")
 		return
 	}
+	if req.RouteSocket != "" && !filepath.IsAbs(req.RouteSocket) {
+		writeError(w, http.StatusBadRequest, "route_socket must be an absolute trusted-host Unix socket path", CodeConfig, "pass the ZKA workspace route through pivb agent-session")
+		return
+	}
 	var source agentsource.Source
 	if req.RequestSource != nil {
 		source = *req.RequestSource
@@ -76,6 +84,7 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 		ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail:       req.ImpersonatedEmail,
 		RequestSource:           source,
+		RouteSocket:             req.RouteSocket,
 	})
 	if err != nil {
 		a.writeCoreError(w, req.Alias, source, err)
@@ -97,6 +106,7 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 	var mismatch *core.RequestMismatchError
 	var invalidSource *core.RequestSourceError
 	var pinErr *pivsigner.PINError
+	var upstreamErr *tokenapi.APIError
 	attrs := []any{"alias", alias}
 	if normalized, _, sourceErr := agentsource.Validate(source, alias); sourceErr == nil {
 		attrs = append(attrs, "source_kind", normalized.Kind)
@@ -105,6 +115,13 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 		}
 	}
 	switch {
+	case errors.As(err, &upstreamErr):
+		a.logger().Warn("forwarded subject-token request failed", append(attrs, "code", upstreamErr.Code, "error", upstreamErr.Message)...)
+		status := upstreamErr.Status
+		if status == 0 {
+			status = http.StatusBadGateway
+		}
+		writeError(w, status, upstreamErr.Message, upstreamErr.Code, upstreamErr.Remedy)
 	case errors.Is(err, core.ErrLocked):
 		a.logger().Warn("subject-token request while locked", attrs...)
 		writeError(w, http.StatusConflict, err.Error(), CodeLocked, "run `pivb unlock` on the trusted host")

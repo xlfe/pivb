@@ -52,6 +52,7 @@ type Descriptor struct {
 	ExternalAccountAudience string `json:"external_account_audience"`
 	TokenLifetimeSeconds    int    `json:"token_lifetime_seconds"`
 	SourceLabel             string `json:"source_label"`
+	RouteKind               string `json:"route_kind,omitempty"`
 }
 
 type Options struct {
@@ -59,6 +60,7 @@ type Options struct {
 	Alias       string
 	SourceLabel string
 	WIFSocket   string
+	RouteSocket string
 	RuntimeDir  string
 	Command     []string
 	Env         []string
@@ -88,7 +90,10 @@ func (e *ChildExitError) Error() string {
 	return fmt.Sprintf("child exited with status %d", e.Code)
 }
 
-type daemonUpstream struct{ client *wifapi.Client }
+type daemonUpstream struct {
+	client      *wifapi.Client
+	routeSocket string
+}
 
 func (u daemonUpstream) SubjectToken(ctx context.Context, req sessionapi.UpstreamRequest) (tokenapi.SubjectTokenResponse, error) {
 	source := req.RequestSource
@@ -97,6 +102,7 @@ func (u daemonUpstream) SubjectToken(ctx context.Context, req sessionapi.Upstrea
 		ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail:       req.ImpersonatedEmail,
 		RequestSource:           &source,
+		RouteSocket:             u.routeSocket,
 	})
 }
 
@@ -112,6 +118,9 @@ func Run(opts Options) error {
 	}
 	if opts.WIFSocket == "" {
 		return errors.New("pivb signing socket location is unknown")
+	}
+	if opts.RouteSocket != "" && !filepath.IsAbs(opts.RouteSocket) {
+		return errors.New("agent-session route socket must be absolute")
 	}
 	if len(opts.Command) == 0 || opts.Command[0] == "" {
 		return errors.New("agent-session requires a child command after --")
@@ -188,6 +197,9 @@ func Run(opts Options) error {
 		TokenLifetimeSeconds:    aliasCfg.LifetimeS,
 		SourceLabel:             opts.SourceLabel,
 	}
+	if opts.RouteSocket != "" {
+		descriptor.RouteKind = "zka-workspace"
+	}
 	descriptorJSON, err := json.MarshalIndent(descriptor, "", "  ")
 	if err != nil {
 		listener.Close()
@@ -206,7 +218,7 @@ func Run(opts Options) error {
 			Alias: opts.Alias, Target: aliasCfg.Target,
 			ExternalAccountAudience: audience, Source: source,
 		},
-		Upstream: daemonUpstream{client: upstreamClient},
+		Upstream: daemonUpstream{client: upstreamClient, routeSocket: opts.RouteSocket},
 	}
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
 	relayDone := make(chan error, 1)

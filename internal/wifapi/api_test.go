@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -129,8 +130,17 @@ func TestSubjectTokenForwardsRequestVerbatim(t *testing.T) {
 		ExternalAccountAudience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pivb-pool/providers/pivb-provider",
 		ImpersonatedEmail:       "readonly-sa@example-project-id.iam.gserviceaccount.com",
 	}
-	if fake.got != want {
+	if !reflect.DeepEqual(fake.got, want) {
 		t.Errorf("core request = %+v, want %+v", fake.got, want)
+	}
+}
+
+func TestSubjectTokenRejectsRelativeTrustedRoute(t *testing.T) {
+	fake := okCore()
+	body := strings.TrimSuffix(validRequestBody(), "}") + `,"route_socket":"relative.sock"}`
+	rec := post(t, quietAPI(fake).Handler(), body)
+	if rec.Code != http.StatusBadRequest || fake.calls != 0 || !strings.Contains(rec.Body.String(), "absolute") {
+		t.Fatalf("relative route response = %d %q, calls=%d", rec.Code, rec.Body.String(), fake.calls)
 	}
 }
 
@@ -428,7 +438,7 @@ func TestClientSuccess(t *testing.T) {
 	if resp.ExpirationTime != testExpiry {
 		t.Errorf("ExpirationTime = %d, want %d", resp.ExpirationTime, testExpiry)
 	}
-	if got := (core.SubjectTokenRequest{Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience, ImpersonatedEmail: req.ImpersonatedEmail}); fake.got != got {
+	if got := (core.SubjectTokenRequest{Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience, ImpersonatedEmail: req.ImpersonatedEmail}); !reflect.DeepEqual(fake.got, got) {
 		t.Errorf("core request = %+v, want %+v", fake.got, got)
 	}
 }

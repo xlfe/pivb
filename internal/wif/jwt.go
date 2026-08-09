@@ -6,13 +6,18 @@
 package wif
 
 import (
+	"bytes"
+	"crypto"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -67,6 +72,16 @@ type header struct {
 	Alg string `json:"alg"`
 	Typ string `json:"typ"`
 	Kid string `json:"kid"`
+}
+
+// VerifiedToken is the strictly decoded result of verifying a forwarded PIVB
+// assertion. Forwarded assertions are never trusted merely because they
+// arrived over an authenticated transport: the receiving pivbd re-validates
+// their complete shape and signature against its local enrollment.
+type VerifiedToken struct {
+	HeaderKeyID string
+	Claims      Claims
+	PublicKey   *rsa.PublicKey
 }
 
 // Claims is the fixed OIDC subject-token claim set. The daemon never accepts
@@ -166,4 +181,64 @@ func Assemble(input string, signature []byte) (string, error) {
 		return "", errors.New("empty RS256 signature")
 	}
 	return input + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+}
+
+// VerifyForwarded verifies a compact PIVB assertion using the public SPKI
+// returned by the provider. It rejects extensions to the fixed header and
+// claim schemas as well as non-RSA-2048/F4 keys.
+func VerifyForwarded(token string, spki []byte) (VerifiedToken, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return VerifiedToken{}, errors.New("forwarded subject token is not a three-part compact JWS")
+	}
+	decode := func(label, encoded string, dst any) error {
+		raw, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return fmt.Errorf("decode forwarded %s: %w", label, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(dst); err != nil {
+			return fmt.Errorf("decode forwarded %s JSON: %w", label, err)
+		}
+		if err := dec.Decode(&struct{}{}); err != io.EOF {
+			return fmt.Errorf("decode forwarded %s JSON: multiple values", label)
+		}
+		return nil
+	}
+	var h header
+	if err := decode("header", parts[0], &h); err != nil {
+		return VerifiedToken{}, err
+	}
+	if h.Alg != "RS256" || h.Typ != "JWT" || h.Kid == "" {
+		return VerifiedToken{}, fmt.Errorf("forwarded JWS header must be alg=RS256, typ=JWT, and carry kid")
+	}
+	var claims Claims
+	if err := decode("claims", parts[1], &claims); err != nil {
+		return VerifiedToken{}, err
+	}
+	parsed, err := x509.ParsePKIXPublicKey(spki)
+	if err != nil {
+		return VerifiedToken{}, fmt.Errorf("parse forwarded SubjectPublicKeyInfo: %w", err)
+	}
+	pub, ok := parsed.(*rsa.PublicKey)
+	if !ok || pub.N.BitLen() != 2048 || pub.E != rsaPublicExponent {
+		return VerifiedToken{}, errors.New("forwarded public key is not RSA-2048/F4")
+	}
+	kid, err := KeyID(pub)
+	if err != nil {
+		return VerifiedToken{}, err
+	}
+	if h.Kid != kid || claims.KeyID != kid {
+		return VerifiedToken{}, fmt.Errorf("forwarded key identity mismatch: header=%q claims=%q spki=%q", h.Kid, claims.KeyID, kid)
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return VerifiedToken{}, fmt.Errorf("decode forwarded signature: %w", err)
+	}
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], signature); err != nil {
+		return VerifiedToken{}, fmt.Errorf("verify forwarded RS256 signature: %w", err)
+	}
+	return VerifiedToken{HeaderKeyID: h.Kid, Claims: claims, PublicKey: pub}, nil
 }

@@ -1,10 +1,22 @@
 package pivsigner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
 )
+
+type fakeLeaseManager struct{ err error }
+
+func (f fakeLeaseManager) Acquire(context.Context, string) (func(), error) {
+	return func() {}, f.err
+}
+
+type unavailableLeaseError struct{}
+
+func (unavailableLeaseError) Error() string          { return "zkad is restarting" }
+func (unavailableLeaseError) LeaseUnavailable() bool { return true }
 
 func TestSharingViolationClassifier(t *testing.T) {
 	tests := []struct {
@@ -26,5 +38,22 @@ func TestSharingViolationClassifier(t *testing.T) {
 				t.Fatalf("IsSharingViolation(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWorkspaceLeaseFailsClosedWhileDirectLocalMayContinue(t *testing.T) {
+	hardware := &Hardware{Lease: fakeLeaseManager{err: unavailableLeaseError{}}}
+	release, err := hardware.acquireLease(context.Background(), "pivb-mint")
+	if err != nil {
+		t.Fatalf("direct-local lease outage: %v", err)
+	}
+	release()
+
+	if _, err := hardware.acquireLease(RequireLease(context.Background()), "pivb-mint"); err == nil {
+		t.Fatal("workspace-forwarded operation bypassed an unavailable lease")
+	}
+	hardware.Lease = fakeLeaseManager{err: errors.New("lease denied")}
+	if _, err := hardware.acquireLease(context.Background(), "pivb-mint"); err == nil {
+		t.Fatal("direct-local operation bypassed an explicit lease error")
 	}
 }

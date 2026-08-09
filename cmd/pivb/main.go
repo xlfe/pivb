@@ -16,8 +16,10 @@ import (
 
 	"github.com/xlfe/pivb/internal/agentapi"
 	"github.com/xlfe/pivb/internal/agentsession"
+	"github.com/xlfe/pivb/internal/cardlease"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
+	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
 	"github.com/xlfe/pivb/internal/uds"
 	"github.com/xlfe/pivb/internal/version"
@@ -52,6 +54,8 @@ func run(args []string) error {
 	configPath := global.String("config", defaultConfig, "configuration file")
 	controlSocket := global.String("control-socket", runtimeSocketPath("control.sock"), "control Unix socket (status, unlock, lock)")
 	wifSocket := global.String("wif-socket", runtimeSocketPath("wif.sock"), "WIF signing Unix socket")
+	forwardSocket := global.String("forward-socket", "", "PIVB forwarding provider Unix socket (disabled when empty)")
+	cardLeaseSocket := global.String("card-lease-socket", "", "zkad cooperative smart-card lease Unix socket")
 	if err := global.Parse(args); err != nil {
 		return err
 	}
@@ -71,7 +75,12 @@ func run(args []string) error {
 		if *controlSocket == "" || *wifSocket == "" {
 			return errors.New("XDG_RUNTIME_DIR is not set; pass --control-socket and --wif-socket explicitly")
 		}
-		return serve(*configPath, *controlSocket, *wifSocket)
+		for label, socket := range map[string]string{"control": *controlSocket, "wif": *wifSocket, "forward": *forwardSocket, "card lease": *cardLeaseSocket} {
+			if socket != "" && !filepath.IsAbs(socket) {
+				return fmt.Errorf("%s socket must be an absolute path", label)
+			}
+		}
+		return serve(*configPath, *controlSocket, *wifSocket, *forwardSocket, *cardLeaseSocket)
 	case "subject-token":
 		// Machine interface: every outcome is reported as protocol JSON on
 		// stdout, including environment and configuration failures.
@@ -110,7 +119,7 @@ func run(args []string) error {
 	return nil
 }
 
-func serve(configPath, controlSocket, wifSocket string) error {
+func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -120,29 +129,42 @@ func serve(configPath, controlSocket, wifSocket string) error {
 		return err
 	}
 	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger}
+	if cardLeaseSocket != "" {
+		signer.Lease = cardlease.Client{Socket: cardLeaseSocket}
+	}
 	daemonCore := core.New(cfg, signer, version.Value)
 	control := &agentapi.API{Core: daemonCore}
 	signing := &wifapi.API{Core: daemonCore, Logger: logger}
+	forwarding := &forwardapi.API{Backend: forwardBackend{core: daemonCore, logger: logger}}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	errCh := make(chan error, 2)
+	serverCount := 2
+	if forwardSocket != "" {
+		serverCount++
+	}
+	errCh := make(chan error, serverCount)
 	go func() { errCh <- uds.Serve(ctx, controlSocket, control.Handler()) }()
 	go func() { errCh <- uds.Serve(ctx, wifSocket, signing.Handler()) }()
+	if forwardSocket != "" {
+		go func() { errCh <- uds.Serve(ctx, forwardSocket, forwarding.Handler()) }()
+	}
 	logger.Info("pivb serving",
 		"control_socket", controlSocket,
 		"wif_socket", wifSocket,
+		"forward_socket", forwardSocket,
+		"card_lease_socket", cardLeaseSocket,
 		"wif_provider", cfg.Provider().Resource())
 
 	var exitErr error
-	for range 2 {
+	for range serverCount {
 		if err := <-errCh; err != nil && exitErr == nil {
 			exitErr = err
 		}
-		// The first server to exit (error or signal) stops its sibling.
+		// The first server to exit (error or signal) stops its siblings.
 		cancel()
 	}
 	return exitErr
@@ -176,13 +198,13 @@ func zero(b []byte) {
 }
 
 func usage(fs *flag.FlagSet) {
-	fmt.Fprintf(fs.Output(), "usage: pivb [--config path] [--control-socket path] [--wif-socket path] <command>\n\ncommands:\n")
+	fmt.Fprintf(fs.Output(), "usage: pivb [--config path] [--control-socket path] [--wif-socket path] [--forward-socket path] [--card-lease-socket path] <command>\n\ncommands:\n")
 	fmt.Fprintln(fs.Output(), "  serve                                    run the networkless signing daemon")
 	fmt.Fprintln(fs.Output(), "  unlock [--if-needed] [--pinentry-program p]   verify and cache the PIV PIN")
 	fmt.Fprintln(fs.Output(), "  lock                                     drop the cached PIN and signing metadata")
 	fmt.Fprintln(fs.Output(), "  status [--watch d] [--format json|waybar]     card-free daemon status")
 	fmt.Fprintln(fs.Output(), "  subject-token --alias <alias>            executable credential source (machine interface)")
-	fmt.Fprintln(fs.Output(), "  agent-session --alias <a> --source-label <agent>:<project>/<role> -- <command> [args...]")
+	fmt.Fprintln(fs.Output(), "  agent-session [--route-socket <path>] --alias <a> --source-label <agent>:<project>/<role> -- <command> [args...]")
 	fmt.Fprintln(fs.Output(), "  wif jwks --cert <serial>=<pem> ...       build the uploaded JWKS from enrolled certificates")
 	fmt.Fprintln(fs.Output(), "  wif credentials --alias <a> --output <f> --executable <p>   write one credential file")
 	fmt.Fprintln(fs.Output(), "  wif provider-condition                   print provider mapping and condition for gcloud")

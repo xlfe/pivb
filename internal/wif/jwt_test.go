@@ -311,6 +311,14 @@ func TestSignAndVerifyEndToEnd(t *testing.T) {
 	if err := verify(parts[0] + "." + parts[1]); err != nil {
 		t.Fatalf("verify a well-formed token: %v", err)
 	}
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := wif.VerifyForwarded(jws, spki)
+	if err != nil || verified.Claims.Alias != "ro" || verified.HeaderKeyID != kidA {
+		t.Fatalf("VerifyForwarded = %#v, %v", verified, err)
+	}
 
 	tampered := []byte(parts[1])
 	if tampered[0] == 'A' {
@@ -320,6 +328,10 @@ func TestSignAndVerifyEndToEnd(t *testing.T) {
 	}
 	if err := verify(parts[0] + "." + string(tampered)); err == nil {
 		t.Fatalf("verification accepted a tampered payload")
+	}
+	tamperedToken := parts[0] + "." + string(tampered) + "." + parts[2]
+	if _, err := wif.VerifyForwarded(tamperedToken, spki); err == nil {
+		t.Fatal("VerifyForwarded accepted a tampered payload")
 	}
 }
 

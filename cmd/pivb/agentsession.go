@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,17 +22,21 @@ func agentSessionCommand(configPath, wifSocket string, args []string) error {
 		}
 	}
 	if separator < 0 {
-		return errors.New("usage: pivb agent-session --alias <alias> --source-label <agent>:<project>/<role> -- <command> [args...]")
+		return errors.New("usage: pivb agent-session [--route-socket <path>] --alias <alias> --source-label <agent>:<project>/<role> -- <command> [args...]")
 	}
 	fs := flag.NewFlagSet("agent-session", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	alias := fs.String("alias", "", "configured alias to delegate")
 	sourceLabel := fs.String("source-label", "", "operator context as <agent>:<project>/<role>")
+	routeSocket := fs.String("route-socket", "", "trusted-host ZKA workspace PIVB route socket")
 	if err := fs.Parse(args[:separator]); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 || *alias == "" || *sourceLabel == "" || separator+1 >= len(args) {
-		return errors.New("usage: pivb agent-session --alias <alias> --source-label <agent>:<project>/<role> -- <command> [args...]")
+		return errors.New("usage: pivb agent-session [--route-socket <path>] --alias <alias> --source-label <agent>:<project>/<role> -- <command> [args...]")
+	}
+	if *routeSocket != "" && !filepath.IsAbs(*routeSocket) {
+		return errors.New("--route-socket must be an absolute Unix socket path")
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -43,7 +48,7 @@ func agentSessionCommand(configPath, wifSocket string, args []string) error {
 	}
 	if err := agentsession.Run(agentsession.Options{
 		Config: cfg, Alias: *alias, SourceLabel: *sourceLabel,
-		WIFSocket: wifSocket, RuntimeDir: runtimeDir,
+		WIFSocket: wifSocket, RouteSocket: *routeSocket, RuntimeDir: runtimeDir,
 		Command: args[separator+1:],
 	}); err != nil {
 		return err

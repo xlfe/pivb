@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xlfe/pivb/internal/core"
+	"github.com/xlfe/pivb/internal/forwardapi"
 )
 
 type fakeStatusAgent struct {
@@ -68,6 +69,13 @@ func TestFormatWaybarStatus(t *testing.T) {
 	signed.LastSignSerial = testSerialA
 	signed.LastSignKeyID = testKidA
 	signed.LastSignAt = now.Add(-5 * time.Minute)
+	forwarded := signed
+	forwarded.PINCached = false
+	forwarded.PINVerifiedSerial = 0
+	forwarded.LastSignRoute = "zka-workspace-forwarded"
+	forwarded.LastSignForward = &forwardapi.ForwardContext{
+		ProviderNodeID: strings.Repeat("a", 32), WorkspaceID: strings.Repeat("b", 32), Bundle: "work",
+	}
 
 	tests := []struct {
 		name        string
@@ -105,6 +113,17 @@ func TestFormatWaybarStatus(t *testing.T) {
 				"Last mint: ro \u2192 " + testTargetRO,
 				"Signed 5m ago by key 12345678",
 				"Provider: " + testProviderResource,
+			},
+		},
+		{
+			name:      "locked origin after a forwarded mint",
+			status:    forwarded,
+			wantClass: "locked",
+			wantTooltip: []string{
+				"Last mint (forwarded): ro → " + testTargetRO,
+				"Signed remotely 5m ago by YubiKey 12345678",
+				"Provider node: " + strings.Repeat("a", 32),
+				"Workspace: " + strings.Repeat("b", 32) + " · work",
 			},
 		},
 	}

@@ -20,15 +20,16 @@ trusted app → Google auth library → exec `pivb subject-token --alias ro`
         Google auth library → STS → IAM Credentials impersonation → target access token
 ```
 
-The daemon runs as a systemd **user** service and exposes two same-UID sockets
+The daemon runs as a systemd **user** service and exposes three same-UID sockets
 under `$XDG_RUNTIME_DIR/pivb` (directory `0700`, sockets `0600`):
 
 | Socket | API | Holder |
 |---|---|---|
 | `control.sock` | health, status, unlock, lock | trusted interactive session |
 | `wif.sock` | mint one configured subject token | trusted host auth helper |
+| `forward.sock` | describe public provider identity and mint a constrained forwarded subject token | trusted ZKA provider adapter |
 
-Both enforce Linux `SO_PEERCRED` same-real-UID checks, request deadlines, and body
+All three enforce Linux `SO_PEERCRED` same-real-UID checks, request deadlines, and body
 limits. **The peer check cannot distinguish two processes running as the same host
 UID.** Every unsandboxed process in your user session is inside the trust boundary.
 Agent sandboxes must be excluded by mount and network isolation, not by this check —
@@ -589,6 +590,7 @@ sandbox launcher:
 
 ```fish
 pivb agent-session \
+  --route-socket /run/user/(id -u)/zka/pivb/workspace-id.sock \
   --alias ro \
   --source-label codex:agentic/ro \
   -- agent-sandbox-launcher codex
@@ -599,6 +601,13 @@ letters, digits, dots, underscores, or hyphens per component; each component sta
 with a letter, and `role` must equal `--alias`. The label and session ID are bounded
 operator context, not authorization. Any same-UID host process that already reaches
 `wif.sock` can spoof them; the host socket is trusted-host-only for that reason.
+
+`--route-socket` is an optional trusted-host ZKA workspace route. The relay
+captures the absolute path when it starts and injects it only into its request to
+`wif.sock`; it never places that path in the sandbox protocol. The agent-session
+socket remains fixed to `--alias`, and the sandbox still has no provider, card,
+endpoint, or alias selection operation. ZKA may replace the provider behind its
+stable workspace path without restarting the sandbox.
 
 Before starting the child, the supervisor resolves the alias, target, WIF audience,
 and access-token lifetime from the closed config. It creates a unique `0700`
@@ -636,6 +645,32 @@ later request or returns `PIVB_UNAVAILABLE`; it never falls back to broader acce
 The socket intentionally allows repeated subject-token mints until the supervised
 child exits. Removing it prevents new mints but cannot revoke Google credentials
 already obtained by an auth library; those expire within the configured lifetime.
+
+### ZKA forwarding provider
+
+`forward.sock` is a trusted-host, versioned HTTP-over-Unix-socket API. Its
+current wire version is 2; strict decoding makes mixed PIVB/ZKA versions fail
+closed with an upgrade-together error. It has three operations:
+
+- `GET /v1/policy` returns the card-free provider/issuer, alias bindings, and
+  enrolled serial/key-ID pairs so an origin can reject a mismatched claim.
+- `GET /v1/describe` returns the configured provider/issuer, alias-to-target
+  bindings, and the live slot-9c serial, JWK key ID, and SPKI.
+- `POST /v1/mint` accepts one complete semantic PIVB mint request with a required
+  expected card and authenticated ZKA routing context.
+
+It has no PIN, unlock, control, raw-signing, digest, APDU, or PC/SC operation.
+The provider rejects an alias, target, audience, or live card that differs from
+the request before signing. The receiving pivbd independently verifies the forwarded JWT's
+signature, SPKI, issuer, audience, claims, lifetime, and local enrollment before
+it returns the token to its ordinary `wif.sock` caller. Structured PIVB error codes,
+including `PIVB_LOCKED` and `PIVB_UNAVAILABLE`, survive the extra hop.
+
+The forwarding socket is not a sandbox capability. A machine launcher exposes
+only the ordinary four agent-session artifacts and passes the ZKA route to
+`agent-session` on the trusted host. The ZKA repository's
+`docs/pivb-credential-bundles.md` specifies claim, takeover, release, and
+stable-route behavior.
 
 ### Subject token
 
@@ -690,6 +725,17 @@ direct USB fallback. The unit also sets `NoNewPrivileges=yes`, `UMask=0077`, emp
 `ProtectControlGroups` set, and `RuntimeDirectory=pivb` with
 `RuntimeDirectoryMode=0700`.
 
+The installed unit enables `forward.sock`, configures
+`--card-lease-socket=%t/zka/card-lease.sock`, and orders itself after
+`zkad.service` without requiring it. PIVB holds that same-UID Unix connection only for a
+describe, PIN verification, or signing operation. ZKA holds the same cooperative
+lease for filtered OpenPGP private operations. Workspace-forwarded describe and
+mint operations require the lease and fail closed when it is unavailable.
+Direct-local unlock and mint operations retry a missing socket briefly, then
+retain their pre-ZKA behavior; explicit lease denials and protocol failures
+always fail closed. `PrivateNetwork` and `RestrictAddressFamilies=AF_UNIX`
+remain unchanged.
+
 Verify the effective sandbox after any change:
 
 ```console
@@ -706,7 +752,7 @@ control. Four paths can break under it, and only a live test settles each:
 | PC/SC under `PrivateDevices=yes` | `pivb unlock` with a card inserted | pcscd uses a filesystem socket, so this should pass. If it does not, find which device path is genuinely needed rather than dropping `PrivateDevices`. |
 | `gpgconf --kill scdaemon` under `ProtectSystem=strict` | provoke a sharing violation: start a GPG smart-card operation, then mint concurrently | Expect exactly one WARN, one scdaemon kill, one retry, and a successful token. gpgconf execs a binary and talks to gpg-agent over a socket in `$XDG_RUNTIME_DIR`; connecting to a socket needs no writable mount, but verify rather than assume. |
 | D-Bus notifications | mint and watch for the touch prompt naming alias, target, and `local-wif` | The session bus is a Unix socket, unaffected by `PrivateNetwork`. |
-| Runtime socket creation under `ProtectSystem=strict` | `systemctl --user restart pivb`, then confirm both sockets are `0600` in a `0700` directory | `RuntimeDirectory=pivb` is what keeps that path writable. Removing it breaks socket creation. |
+| Runtime socket creation under `ProtectSystem=strict` | `systemctl --user restart pivb`, then confirm all three sockets are `0600` in a `0700` directory | `RuntimeDirectory=pivb` is what keeps that path writable. Removing it breaks socket creation. |
 
 If desktop notifications cannot survive a tight unit, move notification delivery
 into a separate unprivileged one-shot helper rather than weakening the signing
@@ -717,7 +763,8 @@ while valid host clients keep working.
 
 ## Security and failure behavior
 
-- A PIV connection exists only for one PIN verification or one signature. Card
+- A PIV connection exists only for one provider description, PIN verification,
+  or signature. Card
   selection, serial lookup, the live-certificate check, cross-key PIN verification,
   and signing all happen inside that one session. Status uses cached memory only
   and never opens a card.
@@ -729,7 +776,9 @@ while valid host clients keep working.
 - pivb refuses to spend a card's final PIN retry, both on `unlock` and when trying
   a cached PIN against a swapped card.
 - A confirmed PC/SC sharing violation triggers exactly one `gpgconf --kill
-  scdaemon` and one fresh retry. No other error does.
+  scdaemon` and one fresh retry. No other error does. With the ZKA lease enabled,
+  that retry remains inside the PIVB-held lease; unrelated card consumers that do
+  not participate in the lease can still contend.
 - Signing has a 20-second deadline; the YubiKey normally bounds an ignored touch at
   about 15 seconds. After cancellation pivb waits up to two more seconds for the
   worker to release the card. The helper's socket timeout is 28 seconds, inside the

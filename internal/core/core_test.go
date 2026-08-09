@@ -13,14 +13,19 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/xlfe/pivb/internal/agentsource"
 	"github.com/xlfe/pivb/internal/config"
+	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/wif"
 )
 
 const (
@@ -130,6 +135,14 @@ type fakeSigner struct {
 
 	labels []string
 	counts signerCounts
+}
+
+func (s *fakeSigner) Describe(_ context.Context) (uint32, *x509.Certificate, error) {
+	card, ok := s.cards[s.current]
+	if !ok {
+		return 0, nil, errors.New("no card")
+	}
+	return s.current, card.cert, nil
 }
 
 func (s *fakeSigner) VerifyPIN(_ context.Context, pin string) (uint32, int, error) {
@@ -594,6 +607,26 @@ func TestSubjectTokenRefusesAReplacedSlotKey(t *testing.T) {
 	}
 }
 
+func TestForwardDescriptionAndExpectedCardAreBoundToLiveSession(t *testing.T) {
+	c, signer := newTestCore(t, testConfig("session"), serialA)
+	description, err := c.DescribeForwardProvider(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if description.Card.Serial != serialA || description.Card.KeyID != kidA || description.Aliases["ro"].Target != roTarget {
+		t.Fatalf("description = %#v", description)
+	}
+	unlockOK(t, c, pinA)
+	req := roRequest()
+	req.ExpectedCard = forwardapi.CardIdentity{Serial: serialB, KeyID: kidB, SPKIDER: signer.cards[serialB].cert.RawSubjectPublicKeyInfo}
+	if _, err := c.SubjectToken(context.Background(), req); err == nil || !strings.Contains(err.Error(), "does not match claimed identity") {
+		t.Fatalf("mismatched claimed card error = %v", err)
+	}
+	if signer.counts.signatures != 0 {
+		t.Fatal("mismatched claimed card was allowed to sign")
+	}
+}
+
 func TestNeverModeSpendsTheCachedPINOnOneToken(t *testing.T) {
 	c, signer := newTestCore(t, testConfig("never"), serialA)
 	fixClock(c)
@@ -851,5 +884,189 @@ func TestSharingViolationRetrySignsTheCardItRebuiltTheDigestFor(t *testing.T) {
 	if status.LastSignSerial != serialB || status.LastSignKeyID != kidB || !status.LastSignAt.Equal(now) {
 		t.Errorf("status last-sign = %d/%s at %s, want %d/%s at %s",
 			status.LastSignSerial, status.LastSignKeyID, status.LastSignAt, serialB, kidB, now)
+	}
+}
+
+func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
+	fixtureA := loadFixture(t, "a")
+	fixtureB := loadFixture(t, "b")
+	now := time.Unix(testNowUnix, 0).UTC()
+	card := func(serial uint32, kid string, fixture fixtureKey) forwardapi.CardIdentity {
+		return forwardapi.CardIdentity{Serial: serial, KeyID: kid, SPKIDER: append([]byte(nil), fixture.cert.RawSubjectPublicKeyInfo...)}
+	}
+	cardA := card(serialA, kidA, fixtureA)
+	cardB := card(serialB, kidB, fixtureB)
+	forwardContext := forwardapi.ForwardContext{
+		OriginNodeID: strings.Repeat("a", 32), WorkspaceID: strings.Repeat("b", 32), Bundle: "work",
+		ClaimGeneration: 7, ProviderNodeID: strings.Repeat("c", 32), ProviderAttachID: strings.Repeat("d", 32),
+		OperationID: strings.Repeat("e", 32),
+	}
+
+	type responseCase struct {
+		mutateClaims   func(*wif.Claims)
+		mutateResponse func(*forwardapi.MintResponse)
+		fixture        fixtureKey
+		serial         uint32
+		kid            string
+		expected       forwardapi.CardIdentity
+		wantSuccess    bool
+	}
+	tests := map[string]responseCase{
+		"valid response":                 {wantSuccess: true},
+		"wrong issuer":                   {mutateClaims: func(c *wif.Claims) { c.Iss = "https://attacker.example" }},
+		"wrong audience":                 {mutateClaims: func(c *wif.Claims) { c.Aud = "https://attacker.example/audience" }},
+		"wrong subject":                  {mutateClaims: func(c *wif.Claims) { c.Sub = "pivb-key:attacker" }},
+		"wrong alias":                    {mutateClaims: func(c *wif.Claims) { c.Alias = "deploy" }},
+		"wrong target":                   {mutateClaims: func(c *wif.Claims) { c.Target = deployTarget }},
+		"wrong serial claim":             {mutateClaims: func(c *wif.Claims) { c.Serial = fmt.Sprint(serialB) }},
+		"missing jti":                    {mutateClaims: func(c *wif.Claims) { c.Jti = "" }},
+		"header kid disagrees with SPKI": {mutateClaims: func(c *wif.Claims) { c.KeyID = kidB }},
+		"invalid lifetime":               {mutateClaims: func(c *wif.Claims) { c.Exp++ }},
+		"expired": {mutateClaims: func(c *wif.Claims) {
+			c.Exp = now.Unix()
+			c.Iat = c.Exp - int64(wif.Lifetime/time.Second)
+		}},
+		"pre-dated iat": {mutateClaims: func(c *wif.Claims) {
+			c.Iat = now.Add(-2*wif.ClockSkew - time.Second).Unix()
+			c.Exp = c.Iat + int64(wif.Lifetime/time.Second)
+		}},
+		"future iat": {mutateClaims: func(c *wif.Claims) {
+			c.Iat = now.Add(wif.ClockSkew + time.Second).Unix()
+			c.Exp = c.Iat + int64(wif.Lifetime/time.Second)
+		}},
+		"expiration envelope disagrees": {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpirationTime++ }},
+		"different enrolled fleet card": {fixture: fixtureB, serial: serialB, kid: kidB, expected: cardA},
+		"response card key disagrees": {
+			mutateResponse: func(r *forwardapi.MintResponse) { r.Card.KeyID = kidB; r.ExpectedCard = r.Card },
+		},
+		"response SPKI disagrees with header kid": {
+			mutateResponse: func(r *forwardapi.MintResponse) {
+				r.Card.SPKIDER = append([]byte(nil), cardB.SPKIDER...)
+				r.ExpectedCard = r.Card
+			},
+		},
+		"active route serial pin disagrees": {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpectedCard.Serial = serialB }},
+		"active route key pin disagrees":    {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpectedCard.KeyID = kidB }},
+		"active route SPKI pin disagrees":   {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpectedCard.SPKIDER = append([]byte(nil), cardB.SPKIDER...) }},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture, serial, kid := test.fixture, test.serial, test.kid
+			if fixture.cert == nil {
+				fixture, serial, kid = fixtureA, serialA, kidA
+			}
+			claims, err := wif.NewClaims(testConfig("session").Provider(), "ro", roTarget, serial, kid, testJTI, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.mutateClaims != nil {
+				test.mutateClaims(&claims)
+			}
+			input, err := wif.SigningInput(claims)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signature, err := rsa.SignPKCS1v15(rand.Reader, fixture.key, crypto.SHA256, wif.SigningDigest(input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, err := wif.Assemble(input, signature)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual := card(serial, kid, fixture)
+			expected := test.expected
+			if expected.Serial == 0 {
+				expected = actual
+			}
+			response := forwardapi.MintResponse{
+				Version: forwardapi.ProtocolVersion, IDToken: token, ExpirationTime: claims.Exp,
+				Card: actual, ExpectedCard: expected, ForwardContext: forwardContext,
+			}
+			if test.mutateResponse != nil {
+				test.mutateResponse(&response)
+			}
+			socket := serveForwardResponse(t, response)
+			c, signer := newTestCore(t, testConfig("session"), serialA)
+			c.SetNowForTest(func() time.Time { return now })
+			req := roRequest()
+			req.RouteSocket = socket
+			result, err := c.SubjectToken(context.Background(), req)
+			if test.wantSuccess {
+				if err != nil {
+					t.Fatalf("SubjectToken: %v", err)
+				}
+				if result.Serial != serialA || result.KeyID != kidA {
+					t.Fatalf("forwarded result card = %d/%s", result.Serial, result.KeyID)
+				}
+				status := c.Status()
+				if status.LastSignRoute != "zka-workspace-forwarded" || status.LastSignForward == nil || status.LastSignForward.OperationID != forwardContext.OperationID {
+					t.Fatalf("forwarded status lacks route context: %#v", status)
+				}
+			} else if err == nil {
+				t.Fatalf("hostile forwarded response was accepted: %#v", result)
+			}
+			if signer.counts != (signerCounts{}) {
+				t.Fatalf("origin verification touched its local card: %+v", signer.counts)
+			}
+			if !test.wantSuccess {
+				status := c.Status()
+				if status.LastSignAlias != "" || !status.LastSignAt.IsZero() {
+					t.Fatalf("rejected response recorded a sign event: %#v", status)
+				}
+			}
+		})
+	}
+}
+
+func serveForwardResponse(t *testing.T, response forwardapi.MintResponse) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "pivb-route-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "route.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/mint" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Errorf("encode fake forward response: %v", err)
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	return socket
+}
+
+func TestForwardContextIsVisibleInTouchPrompt(t *testing.T) {
+	c, signer := newTestCore(t, testConfig("session"), serialA)
+	fixClock(c)
+	unlockOK(t, c, pinA)
+	req := roRequest()
+	req.ExpectedCard = forwardapi.CardIdentity{Serial: serialA, KeyID: kidA, SPKIDER: signer.cards[serialA].cert.RawSubjectPublicKeyInfo}
+	req.ForwardContext = forwardapi.ForwardContext{
+		OriginNodeID: strings.Repeat("a", 32), WorkspaceID: strings.Repeat("b", 32), Bundle: "work",
+		ClaimGeneration: 7, ProviderNodeID: strings.Repeat("c", 32), OperationID: strings.Repeat("d", 32),
+	}
+	mintOK(t, c, req)
+	if len(signer.labels) != 1 {
+		t.Fatalf("touch labels = %q", signer.labels)
+	}
+	for _, value := range []string{req.ForwardContext.OriginNodeID, req.ForwardContext.WorkspaceID, "bundle=work", "generation=7", req.ForwardContext.OperationID} {
+		if !strings.Contains(signer.labels[0], value) {
+			t.Errorf("touch label %q does not contain %q", signer.labels[0], value)
+		}
 	}
 }

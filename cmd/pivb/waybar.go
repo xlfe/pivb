@@ -132,8 +132,21 @@ func formatWaybarStatus(status core.Status, statusErr error, now time.Time) wayb
 		lines = append(lines, "PIN not cached — run `pivb unlock`")
 	}
 	if status.LastSignAlias != "" {
-		lines = append(lines, "Last mint: "+status.LastSignAlias+" → "+status.LastSignTarget)
-		lines = append(lines, fmt.Sprintf("Signed %s by key %d", agoText(now.Sub(status.LastSignAt)), status.LastSignSerial))
+		switch status.LastSignRoute {
+		case "zka-workspace-forwarded":
+			lines = append(lines, "Last mint (forwarded): "+status.LastSignAlias+" → "+status.LastSignTarget)
+			lines = append(lines, fmt.Sprintf("Signed remotely %s by YubiKey %d", agoText(now.Sub(status.LastSignAt)), status.LastSignSerial))
+			if status.LastSignForward != nil {
+				lines = append(lines, "Provider node: "+status.LastSignForward.ProviderNodeID)
+				lines = append(lines, "Workspace: "+status.LastSignForward.WorkspaceID+" · "+status.LastSignForward.Bundle)
+			}
+		case "zka-workspace-provider":
+			lines = append(lines, "Last mint (workspace provider): "+status.LastSignAlias+" → "+status.LastSignTarget)
+			lines = append(lines, fmt.Sprintf("Signed %s by local YubiKey %d", agoText(now.Sub(status.LastSignAt)), status.LastSignSerial))
+		default:
+			lines = append(lines, "Last mint: "+status.LastSignAlias+" → "+status.LastSignTarget)
+			lines = append(lines, fmt.Sprintf("Signed %s by key %d", agoText(now.Sub(status.LastSignAt)), status.LastSignSerial))
+		}
 	} else {
 		lines = append(lines, "No mints since unlock")
 	}

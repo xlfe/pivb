@@ -263,7 +263,7 @@ func TestSubjectTokenSuccess(t *testing.T) {
 				ExternalAccountAudience: testAudience,
 				ImpersonatedEmail:       testTargetRO,
 			}
-			if got[0] != wantReq {
+			if !reflect.DeepEqual(got[0], wantReq) {
 				t.Errorf("daemon received %+v, want configured target %+v", got[0], wantReq)
 			}
 		})

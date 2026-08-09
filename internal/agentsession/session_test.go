@@ -49,7 +49,13 @@ func TestAgentSessionChild(t *testing.T) {
 		if mode == "ignore-hup-term" {
 			signal.Ignore(syscall.SIGHUP, syscall.SIGTERM)
 		}
-		_ = os.WriteFile(resultPath, []byte(sessionDir), 0o600)
+		// Publish readiness atomically. os.WriteFile creates the destination
+		// before writing its contents, so a polling parent can otherwise observe
+		// a valid but empty readiness file.
+		pending := resultPath + ".pending"
+		if os.WriteFile(pending, []byte(sessionDir), 0o600) != nil || os.Rename(pending, resultPath) != nil {
+			os.Exit(90)
+		}
 		for {
 			time.Sleep(time.Second)
 		}
@@ -234,6 +240,7 @@ func TestRunRejectsInvalidPreconditions(t *testing.T) {
 		{"nil config", func(o *Options) { o.Config = nil }, "loaded configuration"},
 		{"unknown alias", func(o *Options) { o.Alias = "deploy" }, "not configured"},
 		{"missing WIF socket", func(o *Options) { o.WIFSocket = "" }, "socket location"},
+		{"relative route socket", func(o *Options) { o.RouteSocket = "relative.sock" }, "route socket must be absolute"},
 		{"empty command", func(o *Options) { o.Command = nil }, "child command"},
 		{"relative runtime", func(o *Options) { o.RuntimeDir = "relative" }, "absolute path"},
 		{"unsafe label", func(o *Options) { o.SourceLabel = "codex:bad\nproject/ro" }, "source-label"},
@@ -260,18 +267,7 @@ func TestRunForwardsTerminationAndCleansUp(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(opts) }()
 
-	deadline := time.Now().Add(5 * time.Second)
-	var sessionDir string
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(ready); err == nil {
-			sessionDir = string(data)
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if sessionDir == "" {
-		t.Fatal("child did not become ready")
-	}
+	sessionDir := string(waitForFile(t, ready))
 	signals <- syscall.SIGTERM
 	err := <-done
 	var exit *ChildExitError
@@ -432,7 +428,7 @@ func waitForFile(t *testing.T, path string) []byte {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
 			return data
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -483,6 +479,7 @@ func TestRunRelaysOnlyCapturedIdentityToHostWIF(t *testing.T) {
 	command, env := childCommand("mint", result)
 	opts := baseOptions(runtimeDir, command, env)
 	opts.WIFSocket = hostSocket
+	opts.RouteSocket = filepath.Join(runtimeDir, "zka-workspace.sock")
 	if err := Run(opts); err != nil {
 		t.Fatal(err)
 	}
@@ -491,5 +488,8 @@ func TestRunRelaysOnlyCapturedIdentityToHostWIF(t *testing.T) {
 	}
 	if fake.request.Alias != "ro" || fake.request.ImpersonatedEmail != runtimeTarget || fake.request.RequestSource.Kind != "agent-session" || fake.request.RequestSource.Label != "codex:agentic/ro" {
 		t.Fatalf("host request = %+v", fake.request)
+	}
+	if fake.request.RouteSocket != opts.RouteSocket {
+		t.Fatalf("trusted route socket = %q, want %q", fake.request.RouteSocket, opts.RouteSocket)
 	}
 }

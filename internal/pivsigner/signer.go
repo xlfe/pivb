@@ -52,17 +52,80 @@ type Signer interface {
 	Sign(ctx context.Context, label, pin string, digestFor func(serial uint32, cert *x509.Certificate) ([]byte, error)) (signature []byte, serial uint32, err error)
 }
 
+// Describer is implemented by hardware signers that can report the exact
+// slot-9c public identity without verifying a PIN or requesting a touch.
+type Describer interface {
+	Describe(ctx context.Context) (serial uint32, cert *x509.Certificate, err error)
+}
+
+type LeaseManager interface {
+	Acquire(ctx context.Context, operation string) (release func(), err error)
+}
+
+type requireLeaseKey struct{}
+
+// RequireLease marks a workspace-forwarded operation. These operations must
+// coordinate with ZKA and fail closed if its lease service is unavailable.
+// Direct-local PIVB operations retain their pre-ZKA behavior.
+func RequireLease(ctx context.Context) context.Context {
+	return context.WithValue(ctx, requireLeaseKey{}, true)
+}
+
+type leaseUnavailable interface {
+	LeaseUnavailable() bool
+}
+
 type Hardware struct {
 	Serials  []uint32
 	Notify   []string
 	Logger   *slog.Logger
 	Deadline time.Duration
+	Lease    LeaseManager
 
 	mu             sync.Mutex
 	verifiedSerial uint32
 }
 
+func (h *Hardware) Describe(ctx context.Context) (uint32, *x509.Certificate, error) {
+	release, err := h.acquireLease(ctx, "pivb-describe")
+	if err != nil {
+		return 0, nil, err
+	}
+	defer release()
+	select {
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	default:
+	}
+	yk, serial, err := h.openSelected()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer yk.Close()
+	cert, err := yk.Certificate(piv.SlotSignature)
+	if err != nil {
+		return 0, nil, fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)
+	}
+	if _, err := wifPublicKey(cert); err != nil {
+		return 0, nil, fmt.Errorf("PIV slot 9c on YubiKey %d: %w", serial, err)
+	}
+	return serial, cert, nil
+}
+
+func wifPublicKey(cert *x509.Certificate) (*rsa.PublicKey, error) {
+	public, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok || public.N.BitLen() != 2048 || public.E != 65537 {
+		return nil, errors.New("must contain an RSA-2048/F4 certificate")
+	}
+	return public, nil
+}
+
 func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, error) {
+	release, err := h.acquireLease(ctx, "pivb-unlock")
+	if err != nil {
+		return 0, -1, err
+	}
+	defer release()
 	yk, serial, err := h.openSelected()
 	if err != nil {
 		return 0, -1, err
@@ -99,6 +162,11 @@ func (h *Hardware) Sign(ctx context.Context, label, pin string, digestFor func(u
 	}
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
+	release, err := h.acquireLease(ctx, "pivb-mint")
+	if err != nil {
+		return nil, 0, err
+	}
+	defer release()
 
 	sig, serial, err := h.signAttempt(ctx, label, pin, digestFor)
 	if err == nil || !IsSharingViolation(err) {
@@ -109,6 +177,23 @@ func (h *Hardware) Sign(ctx context.Context, label, pin string, digestFor func(u
 		return nil, 0, fmt.Errorf("sharing violation; kill scdaemon before retry: %w", killErr)
 	}
 	return h.signAttempt(ctx, label, pin, digestFor)
+}
+
+func (h *Hardware) acquireLease(ctx context.Context, operation string) (func(), error) {
+	if h.Lease == nil {
+		return func() {}, nil
+	}
+	release, err := h.Lease.Acquire(ctx, operation)
+	if err != nil {
+		var unavailable leaseUnavailable
+		required, _ := ctx.Value(requireLeaseKey{}).(bool)
+		if !required && errors.As(err, &unavailable) && unavailable.LeaseUnavailable() {
+			h.logger().Warn("ZKA smart-card lease is unavailable; continuing direct-local PIVB operation", "operation", operation, "error", err)
+			return func() {}, nil
+		}
+		return nil, fmt.Errorf("acquire cooperative smart-card lease: %w", err)
+	}
+	return release, nil
 }
 
 type signResult struct {
@@ -134,9 +219,8 @@ func (h *Hardware) signAttempt(ctx context.Context, label, pin string, digestFor
 			result <- signResult{err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)}
 			return
 		}
-		public, ok := cert.PublicKey.(*rsa.PublicKey)
-		if !ok || public.N.BitLen() != 2048 {
-			result <- signResult{err: fmt.Errorf("PIV slot 9c on YubiKey %d must contain an RSA-2048 certificate", serial)}
+		if _, err := wifPublicKey(cert); err != nil {
+			result <- signResult{err: fmt.Errorf("PIV slot 9c on YubiKey %d %w", serial, err)}
 			return
 		}
 		digest, err := digestFor(serial, cert)
