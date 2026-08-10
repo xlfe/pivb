@@ -185,6 +185,9 @@ func TestLoadValidConfig(t *testing.T) {
 	if want := []string{"notify-send", "pivb"}; !reflect.DeepEqual(cfg.NotifyCmd, want) {
 		t.Errorf("NotifyCmd = %q, want %q", cfg.NotifyCmd, want)
 	}
+	if cfg.GnuPGHome != "" {
+		t.Errorf("GnuPGHome = %q, want empty default", cfg.GnuPGHome)
+	}
 	if cfg.WIF.ProjectNumber != "123456789012" {
 		t.Errorf("WIF.ProjectNumber = %q, want %q", cfg.WIF.ProjectNumber, "123456789012")
 	}
@@ -243,11 +246,25 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if want := []string{"notify-send", "pivb"}; !reflect.DeepEqual(cfg.NotifyCmd, want) {
 		t.Errorf("default NotifyCmd = %q, want %q", cfg.NotifyCmd, want)
 	}
+	if cfg.GnuPGHome != "" {
+		t.Errorf("default GnuPGHome = %q, want empty (environment/default resolved lazily)", cfg.GnuPGHome)
+	}
 	if got := cfg.Aliases["ro"].Cloud; got != "gcp" {
 		t.Errorf("default alias cloud = %q, want %q", got, "gcp")
 	}
 	if got := cfg.Aliases["ro"].LifetimeS; got != defaultLifetimeS {
 		t.Errorf("default alias lifetime_s = %d, want %d", got, defaultLifetimeS)
+	}
+}
+
+func TestLoadRejectsRelativeGnuPGHomeButDoesNotRequireItToExist(t *testing.T) {
+	wantSubstrings(t, loadError(t, withGlobal(`gnupg_home = "relative/home"`)), "gnupg_home", "absolute")
+	cfg, err := loadFrom(t, withGlobal(`gnupg_home = "/path/that/need/not/be/mounted/yet"`))
+	if err != nil {
+		t.Fatalf("lazy GnuPG home validation rejected missing path: %v", err)
+	}
+	if cfg.GnuPGHome != "/path/that/need/not/be/mounted/yet" {
+		t.Fatalf("GnuPGHome = %q", cfg.GnuPGHome)
 	}
 }
 

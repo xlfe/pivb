@@ -109,6 +109,7 @@ Copy [`config.example.toml`](config.example.toml) to `~/.config/pivb/config.toml
 piv_slot = "9c"
 pin_cache = "session" # or "never": consume the cached PIN on each mint
 notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
+gnupg_home = "/home/replace-me/.gnupg" # optional absolute custom home
 
 [wif]
 project_number = "123456789012"
@@ -136,7 +137,9 @@ The schema is closed and fail-closed. Unknown keys are fatal, and every
 identity-bearing value must match a conservative grammar before it can reach a
 signed claim or a generated Google artifact:
 
-- `piv_slot` must be `"9c"`; `pin_cache` must be `"session"` or `"never"`.
+- `piv_slot` must be `"9c"`; `pin_cache` must be `"session"` or `"never"`;
+  `gnupg_home`, when present, must be absolute but is checked for existence and
+  access only if card-contention recovery uses GnuPG.
 - `wif.project_number` is the nonzero decimal **project number**, not the project ID.
 - `wif.pool_id` and `wif.provider_id` are 4–32 lowercase letters, digits, or
   hyphens, start with a letter, end with a letter or digit, and may not start with
@@ -570,18 +573,18 @@ Failure, exit 1:
 {"version":1,"success":false,"code":"PIVB_LOCKED","message":"PIN is not cached; run `pivb unlock` first"}
 ```
 
-Stable codes:
+Stable codes (the code does not determine HTTP status by itself):
 
-| Code | Meaning |
-|---|---|
-| `PIVB_ENV` | bad invocation, or credential-file environment does not match this host |
-| `PIVB_CONFIG` | config missing/invalid, unknown alias, or audience/target mismatch |
-| `PIVB_UNAVAILABLE` | the daemon is not reachable on the signing socket |
-| `PIVB_LOCKED` | no cached PIN; run `pivb unlock` on the trusted host |
-| `PIVB_PIN` | PIN rejected, or refusing to spend the final PIN retry |
-| `PIVB_SIGN` | PIV signing failed: no/ambiguous card, ignored touch, deadline, PC/SC error |
-| `PIVB_INTERNAL` | malformed daemon response or an unclassified daemon error |
-| `PIVB_PEER` | the socket peer's real UID is not the daemon's — surfaced from the UDS layer |
+| Code | HTTP status | Meaning |
+|---|---:|---|
+| `PIVB_ENV` | 400 | bad invocation, or credential-file environment does not match this host |
+| `PIVB_CONFIG` | 400/403 | config missing/invalid, unknown alias, or audience/target mismatch |
+| `PIVB_UNAVAILABLE` | 503 | the daemon is not reachable on the signing socket |
+| `PIVB_LOCKED` | 409 | no cached PIN; run `pivb unlock` on the trusted host |
+| `PIVB_PIN` | 409/403 | PIN rejected, or refusing to spend the final PIN retry |
+| `PIVB_SIGN` | 502/503 | generic PIV/signing failure, or retryable card contention/insufficient touch window |
+| `PIVB_INTERNAL` | 500 | malformed daemon response or an unclassified daemon error |
+| `PIVB_PEER` | 403 | the socket peer's real UID is not the daemon's — surfaced from the UDS layer |
 
 ### `pivb agent-session`
 
@@ -714,6 +717,26 @@ pcscd is reachable; with `Restart=on-failure` it retries until the system
 smart-card service is available. No YubiKey needs to be inserted for the daemon to
 start.
 
+The user manager does not read Fish startup files. If Fish exports a custom
+`GNUPGHOME`, either set the absolute `gnupg_home` in `config.toml`, or import it
+before starting the service:
+
+```fish
+systemctl --user import-environment GNUPGHOME
+systemctl --user restart pivb.service
+```
+
+When `gnupg_home` or `GNUPGHOME` is set, PIVB passes that explicit home both as
+`--homedir` and `GNUPGHOME`. Otherwise it lets GnuPG perform its normal home
+resolution and logs the expected `~/.gnupg` path only as diagnostic context.
+Missing or unreadable explicit paths are diagnosed lazily during recovery and
+never prevent the daemon from starting. The inherited `PATH` is preferred so
+PIVB targets the same GnuPG build as the user's agent; the Nix package appends
+its own GnuPG only as a fallback and logs the resolved binary, version, home,
+and measured `scd_running` state. Binary/version/socket diagnostics are primed
+synchronously at daemon startup under one 250 ms cap, with a bounded first-use
+fallback. Every child command capture is capped at 4 KiB and marks truncation.
+
 The unit is hardened for a networkless signer. `PrivateNetwork=yes` is the primary
 network boundary and `RestrictAddressFamilies=AF_UNIX` leaves only Unix sockets;
 PC/SC is reached through `/run/pcscd/pcscd.comm`, and `PrivateDevices=yes` blocks a
@@ -747,10 +770,16 @@ Do not tighten this block blindly, and do not trust it until it has run against
 real hardware — hardening that has never met a YubiKey is a hypothesis, not a
 control. Four paths can break under it, and only a live test settles each:
 
+The reader-selection change is likewise hypothesis-driven: the original incident
+was not captured with reader-level and `scd_running` diagnostics before the
+recovery patches landed. Do not claim that hypothesis as the confirmed incident
+root cause until the original multi-reader failure is replayed or equivalently
+correlated in the journal.
+
 | Path | How to test | Notes |
 |---|---|---|
 | PC/SC under `PrivateDevices=yes` | `pivb unlock` with a card inserted | pcscd uses a filesystem socket, so this should pass. If it does not, find which device path is genuinely needed rather than dropping `PrivateDevices`. |
-| `gpgconf --kill scdaemon` under `ProtectSystem=strict` | provoke a sharing violation: start a GPG smart-card operation, then mint concurrently | Expect exactly one WARN, one scdaemon kill, one retry, and a successful token. gpgconf execs a binary and talks to gpg-agent over a socket in `$XDG_RUNTIME_DIR`; connecting to a socket needs no writable mount, but verify rather than assume. |
+| bounded scdaemon hand-off under `ProtectSystem=strict` | provoke a sharing violation: start a GPG smart-card operation, then mint concurrently | Expect grace polling first, a measured `scd_running=true`, at most one hand-off for that recovery episode, post-hand-off polling, and one fresh signing attempt. A transient collision or PIVB-owned session must not kill scdaemon. |
 | D-Bus notifications | mint and watch for the touch prompt naming alias, target, and `local-wif` | The session bus is a Unix socket, unaffected by `PrivateNetwork`. |
 | Runtime socket creation under `ProtectSystem=strict` | `systemctl --user restart pivb`, then confirm all three sockets are `0600` in a `0700` directory | `RuntimeDirectory=pivb` is what keeps that path writable. Removing it breaks socket creation. |
 
@@ -775,14 +804,52 @@ while valid host clients keep working.
   hard error, not a silent choice.
 - pivb refuses to spend a card's final PIN retry, both on `unlock` and when trying
   a cached PIN against a swapped card.
-- A confirmed PC/SC sharing violation triggers exactly one `gpgconf --kill
-  scdaemon` and one fresh retry. No other error does. With the ZKA lease enabled,
-  that retry remains inside the PIVB-held lease; unrelated card consumers that do
-  not participate in the lease can still contend.
-- Signing has a 20-second deadline; the YubiKey normally bounds an ignored touch at
-  about 15 seconds. After cancellation pivb waits up to two more seconds for the
-  worker to release the card. The helper's socket timeout is 28 seconds, inside the
-  30-second credential-source budget.
+- A failed reader is skipped while PIVB looks for an enrolled card. Contention on
+  an unrelated GPG-only key therefore does not arm recovery when a configured key
+  is reachable. If no configured card can be selected, diagnostics retain the
+  full reader list and per-reader failures.
+- Failure-path rescans are capped at 250 ms, skipped near the caller deadline,
+  limited to one process-wide worker, and charged to the two-second recovery
+  budget. A late diagnostic can only log and close its session; it cannot replace
+  the operation's original error or arm recovery.
+- Recovery probes use a 250 ms per-waiter limit and are process-wide
+  single-flight. A later bounded waiter shares the in-flight result instead of
+  launching or counting another PC/SC open. An open with no remaining waiter is
+  not a self-holder; if it later succeeds, PIVB closes it without registering a
+  session or suppressing a later hand-off. Exhaustion logs report `attempts`
+  (actual opens) separately from `probe_waits` (bounded polling observations), so
+  a wedged shared open remains distinguishable from an episode that never polled.
+- A confirmed sharing violation is polled before any side effect. A successfully
+  opened PIVB session suppresses hand-off for the whole episode; a worker merely
+  blocked in `piv.Open` does not. After the grace period, measured
+  `scd_running=false` suppresses hand-off, while `true` permits it and an
+  inspection failure falls back to one hand-off. Hand-off failure is non-fatal;
+  polling continues to the shared two-second cap.
+- Forwarded and agent-session operations share a cooperative limit of two
+  hand-offs per rolling ten seconds. Local-WIF and unlock operations are exempt.
+  Request-source kind is not an authorization boundary: a same-UID peer with
+  direct WIF-socket access can omit it, but already has unrestricted mint access.
+- Signing retains one fresh whole-attempt retry for sharing violations that occur
+  after acquisition. The retry re-reads the certificate and rebuilds the digest,
+  binding the token to the card that actually signs even if cards are swapped.
+- Signing acquires the lease within one second, then starts its 20-second hardware
+  deadline. After cancellation PIVB waits up to two more seconds for the worker,
+  so the caller observes at most 23 seconds and the lease is held at most 22.
+  First-use GnuPG diagnostic fallbacks run synchronously inside that worker;
+  each independent 250 ms cap consumes drain headroom and does not extend the
+  caller bound (at most two fallback windows when both commands were unresolved
+  at startup). They can make the slow-worker warning marginally more likely, but
+  acquisition diagnostics do not register a card session; the warning logs the
+  measured `self_holder` state rather than implying one. Describe and VerifyPIN
+  call acquisition directly, so their first-use fallback is additive to observed
+  latency (with ample room below the forwarding timeout). The fallback is also
+  outside the internal two-second recovery accounting, which may therefore
+  overrun by up to 500 ms once per process without changing the Sign bound.
+  On the initial attempt PIVB declines to prompt when less than 16 seconds remain
+  for touch. The audited retry uses a smaller two-second floor within the remaining
+  hardware window, so recovery cannot make that retry unreachable or emit a prompt
+  with essentially no time left. Describe and unlock retain a two-second
+  lease-acquisition budget.
 - The assertion is never cached, written to disk, or logged. Daemon logs record
   alias, target, serial, key ID, and expiry — never a PIN, subject token, STS
   token, access token, Google ID token, or Authorization header.
@@ -1017,31 +1084,39 @@ With the operator and enrolled hardware, verify:
    library and the generated credential file; touch when prompted.
 2. Swap to each other configured fleet key and repeat without changing config or
    restarting; re-unlock only if the fleet PINs differ.
-3. Ignore a touch; confirm a loud `PIVB_SIGN` failure within roughly 20 seconds and
-   a successful retry afterwards.
-4. Collide a signature with an in-flight GPG operation; observe at most one WARN,
-   one scdaemon kill, and one retry.
-5. `ss -ltnp` and `ss -ltnp6` show no pivb listener, and the daemon cannot reach a
+3. Ignore a touch; confirm failure within the 20-second hardware deadline (a
+   caller observes at most 23 seconds including lease acquisition and worker
+   drain, including any first-use diagnostic fallback), then retry successfully.
+4. Collide a signature with a short GPG operation; confirm grace polling lets the
+   transient collision clear without killing scdaemon. Repeat with persistent
+   scdaemon ownership and observe measured `scd_running=true`, one hand-off,
+   post-hand-off polling, and one fresh attempt.
+5. With a GPG-only YubiKey before the PIVB key in the reader list, hold the GPG key
+   in scdaemon and confirm PIVB selects its free configured key without hand-off.
+6. Start a PIVB touch operation, let its caller time out while the card session is
+   still live, and confirm another request polls without killing scdaemon. Also
+   run the `hardware`-tag short-deadline test and confirm it emits no touch prompt.
+7. `ss -ltnp` and `ss -ltnp6` show no pivb listener, and the daemon cannot reach a
    Google endpoint.
-6. `journalctl --user -u pivb.service` contains no PIN, subject token, STS token,
+8. `journalctl --user -u pivb.service` contains no PIN, subject token, STS token,
    access token, or Authorization header — under success and every tested failure.
-7. Through gcloud/Python, a credential file edited to target another alias's
+9. Through gcloud/Python, a credential file edited to target another alias's
    service account succeeds at STS but is denied by IAM `generateAccessToken`, not
    merely rejected locally.
-8. Remove one card's JWK, re-upload the remaining set, and confirm new exchanges
+10. Remove one card's JWK, re-upload the remaining set, and confirm new exchanges
    with that card fail while other cards keep working.
-9. gcloud and the production JVM backend authenticate through the external-account
+11. gcloud and the production JVM backend authenticate through the external-account
    file with no metadata variables, no browser login, and no manually supplied
    impersonated-email variable.
-10. Generated credential files still work after a NixOS rebuild changes the pivb
+12. Generated credential files still work after a NixOS rebuild changes the pivb
     store path.
-11. Fixed-alias agent sessions pass every [sandbox acceptance
+13. Fixed-alias agent sessions pass every [sandbox acceptance
     test](#sandbox-acceptance-tests), including real gcloud/ADC authentication,
     while raw PIVB and host capabilities remain unreachable.
-12. Every target access token expires within 3600 seconds.
-13. Old broker uploaded keys, Token Creator grants, and broker service accounts are
+14. Every target access token expires within 3600 seconds.
+15. Old broker uploaded keys, Token Creator grants, and broker service accounts are
     absent after the rollback window.
-14. Old remote configuration fails closed with a migration error, and no raw pivb
+16. Old remote configuration fails closed with a migration error, and no raw pivb
     socket is forwarded anywhere.
 
 ## References

@@ -219,6 +219,12 @@ func TestSubjectTokenErrorMapping(t *testing.T) {
 			wantStatus: http.StatusBadGateway,
 			wantCode:   CodeSign,
 		},
+		{
+			name:       "smart card contention",
+			err:        errors.New("open smart card: SCARD_E_SHARING_VIOLATION 0x8010000b"),
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   CodeSign,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

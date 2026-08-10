@@ -24,7 +24,10 @@ import (
 const (
 	ProtocolVersion = 2
 	maxRequestBody  = 16 << 10
-	clientTimeout   = 25 * time.Second
+	// Hardware minting is bounded at 23 seconds (one-second lease acquisition,
+	// 20-second hardware deadline, two-second worker drain), leaving two
+	// seconds for forwarding transport and JSON work.
+	clientTimeout = 25 * time.Second
 )
 
 type CardIdentity struct {

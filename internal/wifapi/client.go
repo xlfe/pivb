@@ -15,8 +15,9 @@ import (
 	"github.com/xlfe/pivb/internal/uds"
 )
 
-// clientTimeout stays under the 30-second credential-source budget while
-// covering the 20-second signing deadline plus one scdaemon retry.
+// clientTimeout stays under the 30-second credential-source budget and two
+// seconds above the agent-session relay. Hardware minting itself is bounded
+// at 23 seconds including lease acquisition and cancellation drain.
 const clientTimeout = 28 * time.Second
 
 type Client struct {

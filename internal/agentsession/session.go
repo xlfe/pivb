@@ -32,6 +32,8 @@ import (
 
 const (
 	DescriptorVersion = 1
+	// One second above the 25-second forwarded-provider client, and two
+	// seconds below the executable/helper clients.
 	upstreamTimeout   = 26 * time.Second
 	staleGrace        = 60 * time.Second
 	relayFailureGrace = 5 * time.Second

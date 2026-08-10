@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 )
 
 type fakeLeaseManager struct{ err error }
 
-func (f fakeLeaseManager) Acquire(context.Context, string) (func(), error) {
+func (f fakeLeaseManager) Acquire(context.Context, string, time.Duration) (func(), error) {
 	return func() {}, f.err
 }
 
@@ -43,17 +44,17 @@ func TestSharingViolationClassifier(t *testing.T) {
 
 func TestWorkspaceLeaseFailsClosedWhileDirectLocalMayContinue(t *testing.T) {
 	hardware := &Hardware{Lease: fakeLeaseManager{err: unavailableLeaseError{}}}
-	release, err := hardware.acquireLease(context.Background(), "pivb-mint")
+	release, err := hardware.acquireLease(context.Background(), "pivb-mint", time.Second)
 	if err != nil {
 		t.Fatalf("direct-local lease outage: %v", err)
 	}
 	release()
 
-	if _, err := hardware.acquireLease(RequireLease(context.Background()), "pivb-mint"); err == nil {
+	if _, err := hardware.acquireLease(RequireLease(context.Background()), "pivb-mint", time.Second); err == nil {
 		t.Fatal("workspace-forwarded operation bypassed an unavailable lease")
 	}
 	hardware.Lease = fakeLeaseManager{err: errors.New("lease denied")}
-	if _, err := hardware.acquireLease(context.Background(), "pivb-mint"); err == nil {
+	if _, err := hardware.acquireLease(context.Background(), "pivb-mint", time.Second); err == nil {
 		t.Fatal("direct-local operation bypassed an explicit lease error")
 	}
 }

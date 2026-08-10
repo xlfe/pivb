@@ -164,6 +164,14 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		return SubjectTokenResult{}, &RequestSourceError{Err: err}
 	}
 	req.RequestSource = source
+	switch {
+	case req.ForwardContext.OperationID != "":
+		ctx = pivsigner.WithOperation(ctx, pivsigner.OriginForwarded, req.ForwardContext.OperationID)
+	case source.Kind == agentsource.KindAgentSession:
+		ctx = pivsigner.WithOperation(ctx, pivsigner.OriginAgentSession, source.SessionID)
+	default:
+		ctx = pivsigner.WithOperation(ctx, pivsigner.OriginLocalWIF, "")
+	}
 	alias, ok := c.cfg.Aliases[req.Alias]
 	if !ok {
 		return SubjectTokenResult{}, &UnknownAliasError{Alias: req.Alias}
@@ -268,7 +276,8 @@ func (c *Core) DescribeForwardProvider(ctx context.Context) (forwardapi.Descript
 	}
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
-	serial, cert, err := describer.Describe(pivsigner.RequireLease(ctx))
+	describeCtx := pivsigner.WithOperation(pivsigner.RequireLease(ctx), pivsigner.OriginForwarded, "")
+	serial, cert, err := describer.Describe(describeCtx)
 	if err != nil {
 		return forwardapi.Description{}, err
 	}

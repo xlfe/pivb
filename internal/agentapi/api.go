@@ -11,6 +11,7 @@ import (
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/jsonhttp"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/tokenapi"
 )
 
 const maxRequestBody = 16 << 10
@@ -19,6 +20,7 @@ type API struct{ Core *core.Core }
 
 type errorResponse struct {
 	Error  string `json:"error"`
+	Code   string `json:"code,omitempty"`
 	Remedy string `json:"remedy,omitempty"`
 }
 
@@ -47,9 +49,14 @@ func (a *API) unlock(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &pinErr) {
 			jsonhttp.Write(w, http.StatusForbidden, struct {
 				Error   string `json:"error"`
+				Code    string `json:"code"`
 				Remedy  string `json:"remedy"`
 				Retries int    `json:"retries"`
-			}{err.Error(), "check the PIN; pivb will never spend the final retry", retries})
+			}{err.Error(), tokenapi.CodePIN, "check the PIN; pivb will never spend the final retry", retries})
+			return
+		}
+		if hardwareErr, ok := pivsigner.MapAPIError(err); ok {
+			writeCodedError(w, hardwareErr.Status, hardwareErr.Message, hardwareErr.Code, hardwareErr.Remedy)
 			return
 		}
 		writeError(w, http.StatusServiceUnavailable, err.Error(), "insert exactly one configured YubiKey and retry")
@@ -65,4 +72,8 @@ func (a *API) lock(w http.ResponseWriter, _ *http.Request) {
 
 func writeError(w http.ResponseWriter, status int, message, remedy string) {
 	jsonhttp.Write(w, status, errorResponse{Error: message, Remedy: remedy})
+}
+
+func writeCodedError(w http.ResponseWriter, status int, message, code, remedy string) {
+	jsonhttp.Write(w, status, errorResponse{Error: message, Code: code, Remedy: remedy})
 }

@@ -56,6 +56,7 @@ type Config struct {
 	PIVSlot   string           `toml:"piv_slot"`
 	PINCache  string           `toml:"pin_cache"`
 	NotifyCmd []string         `toml:"notify_cmd"`
+	GnuPGHome string           `toml:"gnupg_home"`
 	WIF       WIF              `toml:"wif"`
 	Keys      map[string]Key   `toml:"keys"`
 	Aliases   map[string]Alias `toml:"aliases"`
@@ -169,6 +170,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PINCache != "session" && c.PINCache != "never" {
 		fail("config key \"pin_cache\" must be \"session\" or \"never\", got %q", c.PINCache)
+	}
+	if c.GnuPGHome != "" && !filepath.IsAbs(c.GnuPGHome) {
+		fail("config key \"gnupg_home\" must be an absolute path when set, got %q", c.GnuPGHome)
 	}
 
 	if !projectNumberRE.MatchString(c.WIF.ProjectNumber) {

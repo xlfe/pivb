@@ -25,7 +25,7 @@
             # Dependencies are checked in so sandboxed builds never need a Go proxy.
             vendorHash = null;
             subPackages = [ "cmd/pivb" ];
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
             buildInputs = [ pkgs.pcsclite ];
             ldflags = [
               "-s"
@@ -41,6 +41,10 @@
               install -Dm644 systemd/pivb.service "$out/lib/systemd/user/pivb.service"
               substituteInPlace "$out/lib/systemd/user/pivb.service" \
                 --replace-fail '@pivb@' "$out/bin/pivb"
+              # Prefer the user's matching GnuPG from the inherited PATH, but
+              # retain a Nix-provided fallback for the systemd user service.
+              wrapProgram "$out/bin/pivb" \
+                --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.gnupg ]}
             '';
           };
           agentHelper = pkgs.buildGoModule {

@@ -1,6 +1,8 @@
 // Package agentsource validates and renders the trusted-host-asserted operator
-// context attached to fixed-alias agent-session requests. The source is audit
-// context only: alias, target, and audience remain the authorization inputs.
+// context attached to fixed-alias agent-session requests. Alias, target, and
+// audience remain the authorization inputs. Kind also selects a cooperative
+// smart-card recovery throttle; it is not a security boundary because a peer
+// with direct access to the WIF socket may omit Source and normalize to Local.
 package agentsource
 
 import (

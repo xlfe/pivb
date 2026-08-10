@@ -142,6 +142,11 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 		}
 		writeError(w, http.StatusConflict, err.Error(), CodePIN, remedy)
 	default:
+		if hardwareErr, ok := pivsigner.MapAPIError(err); ok {
+			a.logger().Warn("subject-token smart-card contention", append(attrs, "error", err)...)
+			writeError(w, hardwareErr.Status, hardwareErr.Message, hardwareErr.Code, hardwareErr.Remedy)
+			return
+		}
 		a.logger().Warn("subject-token signing failed", append(attrs, "error", err)...)
 		writeError(w, http.StatusBadGateway, err.Error(), CodeSign, "touch the YubiKey when prompted, check the daemon journal, then retry")
 	}

@@ -29,6 +29,8 @@ const (
 	envOutputFile        = execsource.EnvOutputFile
 )
 
+// subjectTokenTimeout is above the 23-second hardware bound and below the
+// external-account credential source's 30-second timeout.
 const subjectTokenTimeout = 28 * time.Second
 
 // subjectTokenCommand implements the executable credential-source protocol.

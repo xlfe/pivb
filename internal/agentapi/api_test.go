@@ -39,6 +39,12 @@ func (fakeSigner) Sign(context.Context, string, string, func(uint32, *x509.Certi
 	panic("control API must never reach the signer")
 }
 
+type busySigner struct{ fakeSigner }
+
+func (busySigner) VerifyPIN(context.Context, string) (uint32, int, error) {
+	return 0, -1, errors.New("open smart card: SCARD_E_SHARING_VIOLATION 0x8010000b")
+}
+
 func testConfig() *config.Config {
 	return &config.Config{
 		PIVSlot:  "9c",
@@ -242,6 +248,24 @@ func TestUnlockWrongPIN(t *testing.T) {
 	}
 }
 
+func TestUnlockContentionHasBusyRemedyAndStableCode(t *testing.T) {
+	api := &API{Core: core.New(testConfig(), busySigner{}, "test-version")}
+	rec := do(t, api.Handler(), http.MethodPost, "/v1/unlock", `{"pin":"123456"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body %q)", rec.Code, rec.Body.String())
+	}
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "PIVB_SIGN" {
+		t.Fatalf("code = %q, want PIVB_SIGN", body.Code)
+	}
+	if strings.Contains(body.Remedy, "insert exactly one") || !strings.Contains(body.Remedy, "competing") {
+		t.Fatalf("remedy = %q, want contention guidance instead of card insertion", body.Remedy)
+	}
+}
+
 func TestUnlockBadRequests(t *testing.T) {
 	tests := []struct {
 		name string
@@ -376,8 +400,14 @@ func TestClientRoundTrip(t *testing.T) {
 	if httpErr.Remedy == "" {
 		t.Error("HTTPError.Remedy is empty")
 	}
+	if httpErr.Code != "PIVB_PIN" {
+		t.Errorf("HTTPError.Code = %q, want PIVB_PIN", httpErr.Code)
+	}
 	if !strings.Contains(httpErr.Error(), "403") {
 		t.Errorf("HTTPError.Error() = %q, want it to mention the status", httpErr.Error())
+	}
+	if !strings.Contains(httpErr.Error(), "PIVB_PIN") {
+		t.Errorf("HTTPError.Error() = %q, want it to mention the stable code", httpErr.Error())
 	}
 }
 

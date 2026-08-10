@@ -128,7 +128,8 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 	if err := pivsigner.CheckPCSC(); err != nil {
 		return err
 	}
-	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger}
+	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger, GnuPGHome: cfg.GnuPGHome}
+	signer.PrimeGnuPGDiagnostics()
 	if cardLeaseSocket != "" {
 		signer.Lease = cardlease.Client{Socket: cardLeaseSocket}
 	}

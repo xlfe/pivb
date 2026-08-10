@@ -107,6 +107,9 @@ func mapForwardError(err error) *tokenapi.APIError {
 		}
 		return &tokenapi.APIError{Status: http.StatusConflict, Code: tokenapi.CodePIN, Message: err.Error(), Remedy: remedy}
 	default:
+		if hardwareErr, ok := pivsigner.MapAPIError(err); ok {
+			return hardwareErr
+		}
 		return &tokenapi.APIError{Status: http.StatusBadGateway, Code: tokenapi.CodeSign, Message: fmt.Sprintf("PIVB provider failed: %v", err), Remedy: "check the provider card, touch prompt, and daemon journal"}
 	}
 }

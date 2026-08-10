@@ -15,6 +15,8 @@ import (
 	"github.com/xlfe/pivb/internal/uds"
 )
 
+// HelperTimeout leaves two seconds above the agent-session relay and below
+// the external-account executable's 30-second contract.
 const HelperTimeout = 28 * time.Second
 
 type Client struct {

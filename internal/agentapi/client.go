@@ -46,14 +46,19 @@ type HTTPError struct {
 	Status       int
 	Body         []byte
 	ErrorMessage string
+	Code         string
 	Remedy       string
 }
 
 func (e *HTTPError) Error() string {
-	if e.Remedy != "" {
-		return fmt.Sprintf("control API HTTP %d: %s (remedy: %s)", e.Status, e.ErrorMessage, e.Remedy)
+	code := ""
+	if e.Code != "" {
+		code = " " + e.Code
 	}
-	return fmt.Sprintf("control API HTTP %d: %s", e.Status, e.ErrorMessage)
+	if e.Remedy != "" {
+		return fmt.Sprintf("control API HTTP %d%s: %s (remedy: %s)", e.Status, code, e.ErrorMessage, e.Remedy)
+	}
+	return fmt.Sprintf("control API HTTP %d%s: %s", e.Status, code, e.ErrorMessage)
 }
 
 func (c *Client) call(ctx context.Context, method, path string, input, output any) error {
@@ -87,7 +92,7 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 		if er.Error == "" {
 			er.Error = strings.TrimSpace(string(b))
 		}
-		return &HTTPError{Status: resp.StatusCode, Body: b, ErrorMessage: er.Error, Remedy: er.Remedy}
+		return &HTTPError{Status: resp.StatusCode, Body: b, ErrorMessage: er.Error, Code: er.Code, Remedy: er.Remedy}
 	}
 	if err := json.Unmarshal(b, output); err != nil {
 		return fmt.Errorf("decode pivb control response: %w", err)

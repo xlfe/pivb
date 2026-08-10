@@ -1,6 +1,10 @@
 piv_slot = "9c"
 pin_cache = "session" # or "never": consume the cached PIN on each mint
 notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
+# Optional. systemd --user does not read shell startup files, so set this when
+# the contending scdaemon uses a non-default GnuPG home. Existence and access
+# are checked lazily only when recovery needs GnuPG.
+gnupg_home = "/home/replace-me/.gnupg"
 
 [wif]
 # Numeric project number of the project hosting the workload identity pool,

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-piv/piv-go/v2/piv"
@@ -59,7 +60,7 @@ type Describer interface {
 }
 
 type LeaseManager interface {
-	Acquire(ctx context.Context, operation string) (release func(), err error)
+	Acquire(ctx context.Context, operation string, acquireBudget time.Duration) (release func(), err error)
 }
 
 type requireLeaseKey struct{}
@@ -76,18 +77,48 @@ type leaseUnavailable interface {
 }
 
 type Hardware struct {
-	Serials  []uint32
-	Notify   []string
-	Logger   *slog.Logger
-	Deadline time.Duration
-	Lease    LeaseManager
+	Serials   []uint32
+	Notify    []string
+	Logger    *slog.Logger
+	Deadline  time.Duration
+	Lease     LeaseManager
+	GnuPGHome string
 
 	mu             sync.Mutex
 	verifiedSerial uint32
+
+	openSessions      atomic.Int64
+	openWorkers       atomic.Int64
+	blockedOpenEvents atomic.Uint64
+	diagnosticWorker  atomic.Bool
+	probeMu           sync.Mutex
+	probe             *probeCall
+	recoveryMu        sync.Mutex
+	handoffs          []time.Time
+	gpgConnectLogOnce sync.Once
+	gpgconfLogOnce    sync.Once
+	gnupgTargetOnce   sync.Once
+
+	// Injectable package seams. Production leaves these nil and uses piv-go,
+	// os/exec, and the real clock.
+	listReaders         func() ([]string, error)
+	openReader          func(string) (card, error)
+	inspectSCD          func(context.Context) (scdaemonState, error)
+	handoff             func(context.Context) error
+	command             func(context.Context, string, []string, string) ([]byte, error)
+	lookPath            func(string) (string, error)
+	now                 func() time.Time
+	sleep               func(context.Context, time.Duration) error
+	notifyFunc          func(string)
+	recoveryGrace       time.Duration
+	recoveryLimit       time.Duration
+	minTouchWindow      time.Duration
+	minRetryTouchWindow time.Duration
 }
 
 func (h *Hardware) Describe(ctx context.Context) (uint32, *x509.Certificate, error) {
-	release, err := h.acquireLease(ctx, "pivb-describe")
+	op := operationFrom(ctx, OriginForwarded)
+	release, err := h.acquireLease(ctx, "pivb-describe", 2*time.Second)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -97,7 +128,7 @@ func (h *Hardware) Describe(ctx context.Context) (uint32, *x509.Certificate, err
 		return 0, nil, ctx.Err()
 	default:
 	}
-	yk, serial, err := h.openSelected()
+	yk, serial, err := h.acquireCard(ctx, op, h.newRecoveryBudget())
 	if err != nil {
 		return 0, nil, err
 	}
@@ -121,12 +152,13 @@ func wifPublicKey(cert *x509.Certificate) (*rsa.PublicKey, error) {
 }
 
 func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, error) {
-	release, err := h.acquireLease(ctx, "pivb-unlock")
+	op := operationFrom(ctx, OriginUnlock)
+	release, err := h.acquireLease(ctx, "pivb-unlock", 2*time.Second)
 	if err != nil {
 		return 0, -1, err
 	}
 	defer release()
-	yk, serial, err := h.openSelected()
+	yk, serial, err := h.acquireCard(ctx, op, h.newRecoveryBudget())
 	if err != nil {
 		return 0, -1, err
 	}
@@ -156,34 +188,48 @@ func (h *Hardware) VerifyPIN(ctx context.Context, pin string) (uint32, int, erro
 }
 
 func (h *Hardware) Sign(ctx context.Context, label, pin string, digestFor func(uint32, *x509.Certificate) ([]byte, error)) ([]byte, uint32, error) {
+	op := operationFrom(ctx, OriginUnclassified)
+	// Lease acquisition precedes the hardware deadline. The mint-specific one
+	// second acquisition cap plus 20 second hardware window and two second
+	// cancellation drain gives callers a hard 23 second upper bound. A bounded
+	// first-use GnuPG diagnostic may ignore the hardware context, but it runs in
+	// this worker and is therefore covered by the cancellation drain. In the
+	// worst case, unresolved connect-agent and gpgconf diagnostics can use two
+	// 250ms fallback windows of that headroom, but acquisition diagnostics do not
+	// register an open card session.
+	release, err := h.acquireLease(ctx, "pivb-mint", time.Second)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer release()
 	deadline := h.Deadline
 	if deadline == 0 {
 		deadline = 20 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	release, err := h.acquireLease(ctx, "pivb-mint")
-	if err != nil {
-		return nil, 0, err
-	}
-	defer release()
+	budget := h.newRecoveryBudget()
 
-	sig, serial, err := h.signAttempt(ctx, label, pin, digestFor)
-	if err == nil || !IsSharingViolation(err) {
+	sig, serial, err := h.signAttempt(ctx, op, budget, true, label, pin, digestFor)
+	var handled *acquisitionHandledError
+	if err == nil || errors.As(err, &handled) || !IsSharingViolation(err) {
 		return sig, serial, err
 	}
-	h.logger().Warn("PIV session hit confirmed sharing violation; handing card off from scdaemon and retrying once", "error", err)
-	if killErr := exec.CommandContext(ctx, "gpgconf", "--kill", "scdaemon").Run(); killErr != nil {
-		return nil, 0, fmt.Errorf("sharing violation; kill scdaemon before retry: %w", killErr)
+	// A sharing violation may surface after acquisition (certificate, PIN, or
+	// transmit). Keep the audited whole-attempt retry: the retry re-reads the
+	// certificate and digestFor rebuilds the digest for the card that signs.
+	retrySig, retrySerial, retryErr := h.signAttempt(ctx, op, budget, false, label, pin, digestFor)
+	if retryErr != nil {
+		h.logger().Warn("fresh signing attempt after sharing violation failed", "operation", op.Origin, "operation_id", op.ID, "initial_error", err, "retry_error", retryErr)
 	}
-	return h.signAttempt(ctx, label, pin, digestFor)
+	return retrySig, retrySerial, retryErr
 }
 
-func (h *Hardware) acquireLease(ctx context.Context, operation string) (func(), error) {
+func (h *Hardware) acquireLease(ctx context.Context, operation string, budget time.Duration) (func(), error) {
 	if h.Lease == nil {
 		return func() {}, nil
 	}
-	release, err := h.Lease.Acquire(ctx, operation)
+	release, err := h.Lease.Acquire(ctx, operation, budget)
 	if err != nil {
 		var unavailable leaseUnavailable
 		required, _ := ctx.Value(requireLeaseKey{}).(bool)
@@ -202,52 +248,77 @@ type signResult struct {
 	err    error
 }
 
-func (h *Hardware) signAttempt(ctx context.Context, label, pin string, digestFor func(uint32, *x509.Certificate) ([]byte, error)) ([]byte, uint32, error) {
+func (h *Hardware) signAttempt(ctx context.Context, op operationInfo, budget *recoveryBudget, reserveTouchWindow bool, label, pin string, digestFor func(uint32, *x509.Certificate) ([]byte, error)) ([]byte, uint32, error) {
 	result := make(chan signResult, 1)
 	go func() {
-		yk, serial, err := h.openSelected()
+		yk, serial, err := h.acquireCard(ctx, op, budget)
 		if err != nil {
 			result <- signResult{err: err}
 			return
 		}
-		defer yk.Close()
+		finish := func(r signResult) {
+			// The close/unregister happens before the result is observable, so a
+			// following request cannot mistake this completed worker for an
+			// orphan that still owns the card.
+			_ = yk.Close()
+			result <- r
+		}
 		// Failures before verifyCachedPIN must not report a serial: a nonzero
 		// serial in the result tells the caller the cached PIN was verified
 		// against that card during this operation.
 		cert, err := yk.Certificate(piv.SlotSignature)
 		if err != nil {
-			result <- signResult{err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)}
+			finish(signResult{err: fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: %w", serial, err)})
 			return
 		}
 		if _, err := wifPublicKey(cert); err != nil {
-			result <- signResult{err: fmt.Errorf("PIV slot 9c on YubiKey %d %w", serial, err)}
+			finish(signResult{err: fmt.Errorf("PIV slot 9c on YubiKey %d %w", serial, err)})
 			return
 		}
 		digest, err := digestFor(serial, cert)
 		if err != nil {
-			result <- signResult{err: fmt.Errorf("build signing digest for YubiKey %d: %w", serial, err)}
+			finish(signResult{err: fmt.Errorf("build signing digest for YubiKey %d: %w", serial, err)})
 			return
 		}
 		if err := h.verifyCachedPIN(yk, serial, pin); err != nil {
-			result <- signResult{err: err}
+			finish(signResult{err: err})
 			return
 		}
 		key, err := yk.PrivateKey(piv.SlotSignature, cert.PublicKey, piv.KeyAuth{PIN: pin})
 		if err != nil {
-			result <- signResult{serial: serial, err: fmt.Errorf("open PIV private key on YubiKey %d: %w", serial, err)}
+			finish(signResult{serial: serial, err: fmt.Errorf("open PIV private key on YubiKey %d: %w", serial, err)})
 			return
 		}
 		signer, ok := key.(crypto.Signer)
 		if !ok {
-			result <- signResult{serial: serial, err: errors.New("PIV private key does not implement crypto.Signer")}
+			finish(signResult{serial: serial, err: errors.New("PIV private key does not implement crypto.Signer")})
 			return
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			minimum := h.minRetryTouchWindow
+			if reserveTouchWindow {
+				minimum = h.minTouchWindow
+				if minimum <= 0 {
+					minimum = 16 * time.Second
+				}
+			} else if minimum <= 0 {
+				minimum = 2 * time.Second
+			}
+			if remaining < minimum {
+				if remaining < 0 {
+					remaining = 0
+				}
+				finish(signResult{serial: serial, err: &TouchWindowError{Remaining: remaining}})
+				return
+			}
 		}
 		h.notify("Touch YubiKey to sign " + label)
 		sig, err := signer.Sign(rand.Reader, digest, crypto.SHA256)
 		if err != nil {
 			err = fmt.Errorf("sign with PIV slot 9c on YubiKey %d: %w", serial, err)
 		}
-		result <- signResult{sig: sig, serial: serial, err: err}
+		finish(signResult{sig: sig, serial: serial, err: err})
 	}()
 
 	select {
@@ -257,7 +328,7 @@ func (h *Hardware) signAttempt(ctx context.Context, label, pin string, digestFor
 		select {
 		case <-result:
 		case <-timer.C:
-			h.logger().Warn("PIV signing worker did not release the card promptly after cancellation; a follow-up operation may briefly see it as busy")
+			h.logger().Warn("PIV signing worker did not finish promptly after cancellation; a follow-up operation may briefly see the card path as busy", "self_holder", h.hasSelfHolder(), "open_workers", h.openWorkers.Load())
 		}
 		return nil, 0, fmt.Errorf("PIV signing deadline: %w", ctx.Err())
 	case r := <-result:
@@ -265,7 +336,7 @@ func (h *Hardware) signAttempt(ctx context.Context, label, pin string, digestFor
 	}
 }
 
-func (h *Hardware) verifyCachedPIN(yk *piv.YubiKey, serial uint32, pin string) error {
+func (h *Hardware) verifyCachedPIN(yk card, serial uint32, pin string) error {
 	if h.getVerifiedSerial() == serial {
 		return nil
 	}
@@ -308,50 +379,6 @@ func (h *Hardware) setVerifiedSerial(serial uint32) {
 	h.mu.Unlock()
 }
 
-func (h *Hardware) openSelected() (*piv.YubiKey, uint32, error) {
-	cards, err := piv.Cards()
-	if err != nil {
-		return nil, 0, fmt.Errorf("enumerate smart cards: %w", err)
-	}
-	wanted := make(map[uint32]struct{}, len(h.Serials))
-	for _, serial := range h.Serials {
-		wanted[serial] = struct{}{}
-	}
-	var selected *piv.YubiKey
-	var selectedSerial uint32
-	for _, card := range cards {
-		yk, err := piv.Open(card)
-		if err != nil {
-			if selected != nil {
-				selected.Close()
-			}
-			return nil, 0, fmt.Errorf("open smart card %q: %w", card, err)
-		}
-		serial, err := yk.Serial()
-		if err != nil {
-			yk.Close()
-			if selected != nil {
-				selected.Close()
-			}
-			return nil, 0, fmt.Errorf("read serial for smart card %q: %w", card, err)
-		}
-		if _, ok := wanted[serial]; !ok {
-			yk.Close()
-			continue
-		}
-		if selected != nil {
-			yk.Close()
-			selected.Close()
-			return nil, 0, fmt.Errorf("multiple configured YubiKeys are present (%d and %d); leave exactly one inserted", selectedSerial, serial)
-		}
-		selected, selectedSerial = yk, serial
-	}
-	if selected == nil {
-		return nil, 0, fmt.Errorf("no configured YubiKey present (wanted serials %v)", h.Serials)
-	}
-	return selected, selectedSerial, nil
-}
-
 func IsSharingViolation(err error) bool {
 	if err == nil {
 		return false
@@ -363,6 +390,10 @@ func IsSharingViolation(err error) bool {
 }
 
 func (h *Hardware) notify(message string) {
+	if h.notifyFunc != nil {
+		h.notifyFunc(message)
+		return
+	}
 	if len(h.Notify) == 0 {
 		return
 	}
