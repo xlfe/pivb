@@ -10,9 +10,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 
 	"github.com/xlfe/pivb/internal/agentsource"
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/jsonhttp"
 	"github.com/xlfe/pivb/internal/pivsigner"
@@ -24,13 +24,14 @@ const maxRequestBody = 4 << 10
 
 // Re-export the stable protocol types for compatibility with existing clients.
 const (
-	CodeLocked      = tokenapi.CodeLocked
-	CodeConfig      = tokenapi.CodeConfig
-	CodePIN         = tokenapi.CodePIN
-	CodeSign        = tokenapi.CodeSign
-	CodeUnavailable = tokenapi.CodeUnavailable
-	CodeEnv         = tokenapi.CodeEnv
-	CodeInternal    = tokenapi.CodeInternal
+	CodeLocked        = tokenapi.CodeLocked
+	CodeConfig        = tokenapi.CodeConfig
+	CodePIN           = tokenapi.CodePIN
+	CodeSign          = tokenapi.CodeSign
+	CodeUnavailable   = tokenapi.CodeUnavailable
+	CodeRouteRequired = tokenapi.CodeRouteRequired
+	CodeEnv           = tokenapi.CodeEnv
+	CodeInternal      = tokenapi.CodeInternal
 )
 
 // SubjectTokenRequest is the fixed request shape. Every field is validated
@@ -43,7 +44,8 @@ type SubjectTokenRequest struct {
 	RequestSource           *agentsource.Source `json:"request_source,omitempty"`
 	// RouteSocket is accepted only on the trusted-host wif.sock. The fixed
 	// agent-session relay injects it; the sandbox request has no such field.
-	RouteSocket string `json:"route_socket,omitempty"`
+	RouteSocket   string `json:"route_socket,omitempty"`
+	RouteRequired bool   `json:"route_required,omitempty"`
 }
 
 type SubjectTokenResponse = tokenapi.SubjectTokenResponse
@@ -71,8 +73,15 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), CodeConfig, "send the fixed subject-token request shape")
 		return
 	}
-	if req.RouteSocket != "" && !filepath.IsAbs(req.RouteSocket) {
-		writeError(w, http.StatusBadRequest, "route_socket must be an absolute trusted-host Unix socket path", CodeConfig, "pass the ZKA workspace route through pivb agent-session")
+	attachmentContext := attachment.LocalAllowed()
+	if req.RouteRequired {
+		if err := attachment.ValidateRoute(req.RouteSocket); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), CodeRouteRequired, "recreate the managed pane or agent session")
+			return
+		}
+		attachmentContext = attachment.RouteRequired(attachment.ProtocolEnvironment, req.RouteSocket)
+	} else if req.RouteSocket != "" {
+		writeError(w, http.StatusBadRequest, "route_socket requires route_required", CodeRouteRequired, "use the complete managed attachment protocol")
 		return
 	}
 	var source agentsource.Source
@@ -84,6 +93,7 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 		ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail:       req.ImpersonatedEmail,
 		RequestSource:           source,
+		Attachment:              attachmentContext,
 		RouteSocket:             req.RouteSocket,
 	})
 	if err != nil {
@@ -93,7 +103,9 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 	source, _, _ = agentsource.Validate(source, req.Alias)
 	// Log signing metadata only; the token itself is never logged or cached.
 	attrs := []any{"alias", req.Alias, "target", req.ImpersonatedEmail,
-		"source_kind", source.Kind, "serial", result.Serial, "key_id", result.KeyID, "expires_at", result.ExpiresAt}
+		"source_kind", source.Kind, "attachment_mode", attachmentContext.Mode,
+		"attachment_protocol", attachmentContext.Protocol, "route_kind", routeKind(attachmentContext),
+		"serial", result.Serial, "key_id", result.KeyID, "expires_at", result.ExpiresAt}
 	if source.Kind == agentsource.KindAgentSession {
 		attrs = append(attrs, "source_label", source.Label, "session_id", source.SessionID)
 	}
@@ -105,6 +117,7 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 	var unknownAlias *core.UnknownAliasError
 	var mismatch *core.RequestMismatchError
 	var invalidSource *core.RequestSourceError
+	var policyErr *attachment.PolicyError
 	var pinErr *pivsigner.PINError
 	var upstreamErr *tokenapi.APIError
 	attrs := []any{"alias", alias}
@@ -115,8 +128,16 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 		}
 	}
 	switch {
+	case errors.As(err, &policyErr):
+		a.logger().Warn("subject-token request violates attachment policy", append(attrs, "error", policyErr.Message)...)
+		writeError(w, http.StatusForbidden, policyErr.Message, CodeRouteRequired, "recreate the managed pane or agent session")
 	case errors.As(err, &upstreamErr):
-		a.logger().Warn("forwarded subject-token request failed", append(attrs, "code", upstreamErr.Code, "error", upstreamErr.Message)...)
+		logAttrs := append(attrs, "code", upstreamErr.Code, "error", upstreamErr.Message)
+		if upstreamErr.SecurityRelevant {
+			a.logger().Error("forwarded subject-token response failed a security check", logAttrs...)
+		} else {
+			a.logger().Warn("forwarded subject-token request failed", logAttrs...)
+		}
 		status := upstreamErr.Status
 		if status == 0 {
 			status = http.StatusBadGateway
@@ -150,6 +171,13 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 		a.logger().Warn("subject-token signing failed", append(attrs, "error", err)...)
 		writeError(w, http.StatusBadGateway, err.Error(), CodeSign, "touch the YubiKey when prompted, check the daemon journal, then retry")
 	}
+}
+
+func routeKind(ctx attachment.Context) string {
+	if ctx.RouteRequired() {
+		return "zka-workspace"
+	}
+	return "local"
 }
 
 func writeError(w http.ResponseWriter, status int, message, code, remedy string) {

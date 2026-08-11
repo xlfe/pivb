@@ -510,7 +510,21 @@ pivb status                                   # card-free; never prints a token
 pivb status --watch 5s --format waybar        # Waybar JSON on an interval
 pivb lock                                     # discard cached PIN and signing metadata
 pivb version
+pivb capabilities --format=json               # card-free attachment negotiation
 ```
+
+When ZKA creates a PIVB-enabled managed backend it supplies exactly
+`PIVB_ATTACHMENT_MODE=route-required`, an absolute `PIVB_ROUTE_SOCKET`, and
+`PIVB_ATTACHMENT_PROTOCOL=1`. With no attachment
+variables PIVB retains its standalone local-card behavior. Any partial tuple,
+unknown value, malformed route, or conflicting explicit route fails closed.
+`serve`, `status`, `unlock`, and `lock` reject route-required contexts before
+contacting the local provider; `version`, `capabilities`, and card-free WIF
+configuration commands remain available.
+
+The capability envelope is schema 1 and advertises the supported attachment
+protocols and modes. ZKA must negotiate it before launching a managed backend.
+No route-binding protocol is currently advertised.
 
 `unlock` verifies the PIN without spending the card's final retry and reports the
 remaining count. Without `--pinentry-program` it requires a terminal for hidden
@@ -578,8 +592,9 @@ Stable codes (the code does not determine HTTP status by itself):
 | Code | HTTP status | Meaning |
 |---|---:|---|
 | `PIVB_ENV` | 400 | bad invocation, or credential-file environment does not match this host |
-| `PIVB_CONFIG` | 400/403 | config missing/invalid, unknown alias, or audience/target mismatch |
-| `PIVB_UNAVAILABLE` | 503 | the daemon is not reachable on the signing socket |
+| `PIVB_ROUTE_REQUIRED` | 400/403 | route-required policy is missing, malformed, unknown, or conflicts with an explicit route |
+| `PIVB_CONFIG` | 400/403/502 | config missing/invalid, unknown alias, audience/target mismatch, protocol skew, or a routed response that fails origin verification |
+| `PIVB_UNAVAILABLE` | 503 | the selected local or workspace route cannot be reached or closes |
 | `PIVB_LOCKED` | 409 | no cached PIN; run `pivb unlock` on the trusted host |
 | `PIVB_PIN` | 409/403 | PIN rejected, or refusing to spend the final PIN retry |
 | `PIVB_SIGN` | 502/503 | generic PIV/signing failure, or retryable card contention/insufficient touch window |
@@ -605,12 +620,15 @@ with a letter, and `role` must equal `--alias`. The label and session ID are bou
 operator context, not authorization. Any same-UID host process that already reaches
 `wif.sock` can spoof them; the host socket is trusted-host-only for that reason.
 
-`--route-socket` is an optional trusted-host ZKA workspace route. The relay
-captures the absolute path when it starts and injects it only into its request to
-`wif.sock`; it never places that path in the sandbox protocol. The agent-session
-socket remains fixed to `--alias`, and the sandbox still has no provider, card,
-endpoint, or alias selection operation. ZKA may replace the provider behind its
-stable workspace path without restarting the sandbox.
+`--route-socket` is an optional trusted-host ZKA workspace route. A managed
+route-required environment must already contain the same route; omission of its
+inherited route or an explicit conflict is `PIVB_ROUTE_REQUIRED`. Under protocol
+1 the relay captures the absolute path when it starts and injects it together
+with `route_required: true` only into its request to `wif.sock`; it never places
+that path in the sandbox protocol. The agent-session socket remains fixed to
+`--alias`, and the sandbox still has no provider, card, endpoint, or alias
+selection operation. ZKA may replace the provider behind its stable workspace
+path without restarting the sandbox.
 
 Before starting the child, the supervisor resolves the alias, target, WIF audience,
 and access-token lifetime from the closed config. It creates a unique `0700`
@@ -618,7 +636,8 @@ directory below `$XDG_RUNTIME_DIR/pivb-agent`, containing `session.sock`,
 `credential.json`, and `session.json` as `0600`, then gives the launcher
 `PIVB_AGENT_SESSION_DIR` and `PIVB_AGENT_SESSION_ID`. `session.json` contains the
 non-secret session ID, creation time, alias, target, audience, lifetime, and source
-label.
+label, plus the attachment mode, protocol, and route kind. Its descriptor version
+is 2.
 
 The child stays in the supervisor's foreground process group, so interactive Codex
 and Claude TUIs retain normal terminal job control. The supervisor forwards
@@ -829,6 +848,13 @@ while valid host clients keep working.
   hand-offs per rolling ten seconds. Local-WIF and unlock operations are exempt.
   Request-source kind is not an authorization boundary: a same-UID peer with
   direct WIF-socket access can omit it, but already has unrestricted mint access.
+- Attachment protocol 1 is cooperative environment enforcement. PIVB and ZKA do
+  not expose a cgroup-bound protocol: a same-UID process can join another
+  delegated user scope by writing its PID to that scope's `cgroup.procs`, so
+  cgroup membership is not a non-forgeable workspace identity. Deleting inherited
+  variables or reaching the local WIF socket remains possible unless a separate
+  sandbox hides or mediates the host user bus, Kitty and zkad control sockets,
+  and credential sockets.
 - Signing retains one fresh whole-attempt retry for sharing violations that occur
   after acquisition. The retry re-reads the certificate and rebuilds the digest,
   binding the token to the card that actually signs even if cards are swapped.

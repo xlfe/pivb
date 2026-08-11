@@ -8,13 +8,14 @@ import "fmt"
 // Stable machine-readable error codes surfaced through executable credential
 // sources.
 const (
-	CodeLocked      = "PIVB_LOCKED"
-	CodeConfig      = "PIVB_CONFIG"
-	CodePIN         = "PIVB_PIN"
-	CodeSign        = "PIVB_SIGN"
-	CodeUnavailable = "PIVB_UNAVAILABLE"
-	CodeEnv         = "PIVB_ENV"
-	CodeInternal    = "PIVB_INTERNAL"
+	CodeLocked        = "PIVB_LOCKED"
+	CodeConfig        = "PIVB_CONFIG"
+	CodePIN           = "PIVB_PIN"
+	CodeSign          = "PIVB_SIGN"
+	CodeUnavailable   = "PIVB_UNAVAILABLE"
+	CodeRouteRequired = "PIVB_ROUTE_REQUIRED"
+	CodeEnv           = "PIVB_ENV"
+	CodeInternal      = "PIVB_INTERNAL"
 )
 
 // SubjectTokenResponse carries the subject token and its Unix expiry. No
@@ -33,10 +34,11 @@ type ErrorResponse struct {
 
 // APIError is a structured socket rejection with a stable code.
 type APIError struct {
-	Status  int
-	Code    string
-	Message string
-	Remedy  string
+	Status           int
+	Code             string
+	Message          string
+	Remedy           string
+	SecurityRelevant bool
 }
 
 func (e *APIError) Error() string {

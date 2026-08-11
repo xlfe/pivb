@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/xlfe/pivb/internal/agentsource"
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/sessionapi"
 	"github.com/xlfe/pivb/internal/tokenapi"
@@ -31,7 +32,7 @@ import (
 )
 
 const (
-	DescriptorVersion = 1
+	DescriptorVersion = 2
 	// One second above the 25-second forwarded-provider client, and two
 	// seconds below the executable/helper clients.
 	upstreamTimeout   = 26 * time.Second
@@ -55,6 +56,8 @@ type Descriptor struct {
 	TokenLifetimeSeconds    int    `json:"token_lifetime_seconds"`
 	SourceLabel             string `json:"source_label"`
 	RouteKind               string `json:"route_kind,omitempty"`
+	AttachmentMode          string `json:"attachment_mode"`
+	AttachmentProtocol      int    `json:"attachment_protocol"`
 }
 
 type Options struct {
@@ -62,6 +65,9 @@ type Options struct {
 	Alias       string
 	SourceLabel string
 	WIFSocket   string
+	Attachment  attachment.Context
+	// RouteSocket is the legacy trusted-host spelling retained for callers
+	// while the environment contract moves to Attachment.
 	RouteSocket string
 	RuntimeDir  string
 	Command     []string
@@ -93,8 +99,8 @@ func (e *ChildExitError) Error() string {
 }
 
 type daemonUpstream struct {
-	client      *wifapi.Client
-	routeSocket string
+	client     *wifapi.Client
+	attachment attachment.Context
 }
 
 func (u daemonUpstream) SubjectToken(ctx context.Context, req sessionapi.UpstreamRequest) (tokenapi.SubjectTokenResponse, error) {
@@ -104,7 +110,8 @@ func (u daemonUpstream) SubjectToken(ctx context.Context, req sessionapi.Upstrea
 		ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail:       req.ImpersonatedEmail,
 		RequestSource:           &source,
-		RouteSocket:             u.routeSocket,
+		RouteSocket:             u.attachment.RouteSocket,
+		RouteRequired:           u.attachment.RouteRequired(),
 	})
 }
 
@@ -118,11 +125,19 @@ func Run(opts Options) error {
 	if !ok {
 		return fmt.Errorf("alias %q is not configured", opts.Alias)
 	}
-	if opts.WIFSocket == "" {
-		return errors.New("pivb signing socket location is unknown")
-	}
 	if opts.RouteSocket != "" && !filepath.IsAbs(opts.RouteSocket) {
 		return errors.New("agent-session route socket must be absolute")
+	}
+	var err error
+	opts.Attachment, err = attachment.WithExplicitRoute(opts.Attachment, opts.RouteSocket)
+	if err != nil {
+		return err
+	}
+	if err := opts.Attachment.Validate(); err != nil {
+		return err
+	}
+	if opts.WIFSocket == "" {
+		return errors.New("pivb signing socket location is unknown")
 	}
 	if len(opts.Command) == 0 || opts.Command[0] == "" {
 		return errors.New("agent-session requires a child command after --")
@@ -198,8 +213,10 @@ func Run(opts Options) error {
 		ExternalAccountAudience: audience,
 		TokenLifetimeSeconds:    aliasCfg.LifetimeS,
 		SourceLabel:             opts.SourceLabel,
+		AttachmentMode:          opts.Attachment.Mode,
+		AttachmentProtocol:      opts.Attachment.Protocol,
 	}
-	if opts.RouteSocket != "" {
+	if opts.Attachment.RouteRequired() {
 		descriptor.RouteKind = "zka-workspace"
 	}
 	descriptorJSON, err := json.MarshalIndent(descriptor, "", "  ")
@@ -220,7 +237,7 @@ func Run(opts Options) error {
 			Alias: opts.Alias, Target: aliasCfg.Target,
 			ExternalAccountAudience: audience, Source: source,
 		},
-		Upstream: daemonUpstream{client: upstreamClient, routeSocket: opts.RouteSocket},
+		Upstream: daemonUpstream{client: upstreamClient, attachment: opts.Attachment},
 	}
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
 	relayDone := make(chan error, 1)

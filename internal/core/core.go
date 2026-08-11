@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/xlfe/pivb/internal/agentsource"
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/tokenapi"
 	"github.com/xlfe/pivb/internal/wif"
 )
 
@@ -59,6 +61,7 @@ type SubjectTokenRequest struct {
 	ExternalAccountAudience string
 	ImpersonatedEmail       string
 	RequestSource           agentsource.Source
+	Attachment              attachment.Context
 	// RouteSocket selects a trusted-host ZKA workspace route. It is injected
 	// by agent-session and is never present in the sandbox request shape.
 	RouteSocket    string
@@ -67,11 +70,12 @@ type SubjectTokenRequest struct {
 }
 
 type SubjectTokenResult struct {
-	IDToken   string
-	ExpiresAt time.Time
-	Serial    uint32
-	KeyID     string
-	SPKIDER   []byte
+	IDToken        string
+	ExpiresAt      time.Time
+	Serial         uint32
+	KeyID          string
+	SPKIDER        []byte
+	ForwardContext forwardapi.ForwardContext
 }
 
 // SignEvent records the metadata of the last successful signature for
@@ -159,6 +163,29 @@ func (c *Core) Lock() {
 // to the enrolled key observed in that session. The token is returned to the
 // caller and never retained or logged by the daemon.
 func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (SubjectTokenResult, error) {
+	if err := req.Attachment.Validate(); err != nil {
+		return SubjectTokenResult{}, err
+	}
+	if req.Attachment.RouteRequired() {
+		if req.RouteSocket != "" && req.RouteSocket != req.Attachment.RouteSocket {
+			return SubjectTokenResult{}, &attachment.PolicyError{Message: "trusted request route conflicts with its attachment policy"}
+		}
+		req.RouteSocket = req.Attachment.RouteSocket
+		result, err := RouteSubjectToken(ctx, c.cfg, req, c.now)
+		if err != nil {
+			return SubjectTokenResult{}, err
+		}
+		c.mu.Lock()
+		c.lastSign = &SignEvent{
+			Alias: req.Alias, Target: req.ImpersonatedEmail, Serial: result.Serial, KeyID: result.KeyID,
+			At: c.now().UTC(), Route: "zka-workspace-forwarded", ForwardContext: result.ForwardContext,
+		}
+		c.mu.Unlock()
+		return result, nil
+	}
+	if req.RouteSocket != "" {
+		return SubjectTokenResult{}, &attachment.PolicyError{Message: "local-allowed request cannot select a workspace route"}
+	}
 	source, _, err := agentsource.Validate(req.RequestSource, req.Alias)
 	if err != nil {
 		return SubjectTokenResult{}, &RequestSourceError{Err: err}
@@ -184,10 +211,6 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		return SubjectTokenResult{}, &RequestMismatchError{Field: "impersonated_email", Got: req.ImpersonatedEmail, Want: alias.Target}
 	}
 	keys := c.cfg.KeysBySerial()
-	if req.RouteSocket != "" {
-		return c.forwardSubjectToken(ctx, req, alias, keys)
-	}
-
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
 	pin, err := c.takePIN()
@@ -323,58 +346,114 @@ func (c *Core) ForwardPolicy() forwardapi.Policy {
 	}
 }
 
-func (c *Core) forwardSubjectToken(ctx context.Context, req SubjectTokenRequest, alias config.Alias, keys map[uint32]config.Key) (SubjectTokenResult, error) {
-	started := c.now().UTC()
+// RouteSubjectToken mints and verifies one token through a ZKA route without
+// constructing or touching a local hardware signer. Protocol 1 reaches it
+// through pivbd's trusted WIF API.
+func RouteSubjectToken(ctx context.Context, cfg *config.Config, req SubjectTokenRequest, now func() time.Time) (SubjectTokenResult, error) {
+	if cfg == nil {
+		return SubjectTokenResult{}, &tokenapi.APIError{Status: 500, Code: tokenapi.CodeConfig, Message: "PIVB configuration is unavailable"}
+	}
+	if err := req.Attachment.Validate(); err != nil || !req.Attachment.RouteRequired() {
+		if err == nil {
+			err = &attachment.PolicyError{Message: "routed mint requires route-required attachment policy"}
+		}
+		return SubjectTokenResult{}, err
+	}
+	req.RouteSocket = req.Attachment.RouteSocket
+	source, _, err := agentsource.Validate(req.RequestSource, req.Alias)
+	if err != nil {
+		return SubjectTokenResult{}, &RequestSourceError{Err: err}
+	}
+	req.RequestSource = source
+	alias, ok := cfg.Aliases[req.Alias]
+	if !ok {
+		return SubjectTokenResult{}, &UnknownAliasError{Alias: req.Alias}
+	}
+	provider := cfg.Provider()
+	if want := provider.ExternalAccountAudience(); req.ExternalAccountAudience != want {
+		return SubjectTokenResult{}, &RequestMismatchError{Field: "external_account_audience", Got: req.ExternalAccountAudience, Want: want}
+	}
+	if req.ImpersonatedEmail != alias.Target {
+		return SubjectTokenResult{}, &RequestMismatchError{Field: "impersonated_email", Got: req.ImpersonatedEmail, Want: alias.Target}
+	}
+	keys := cfg.KeysBySerial()
+	if now == nil {
+		now = time.Now
+	}
+	started := now().UTC()
 	client := forwardapi.NewClientWithTimeout(req.RouteSocket, 25*time.Second)
 	defer client.HTTP.CloseIdleConnections()
-	source := req.RequestSource
 	response, err := client.Mint(ctx, forwardapi.MintRequest{
 		Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience,
-		ImpersonatedEmail: req.ImpersonatedEmail, RequestSource: &source,
+		ImpersonatedEmail: req.ImpersonatedEmail, RequestSource: &req.RequestSource,
 	})
 	if err != nil {
-		return SubjectTokenResult{}, err
+		return SubjectTokenResult{}, mapRouteError(err)
 	}
 	if response.Card.Serial != response.ExpectedCard.Serial || response.Card.KeyID != response.ExpectedCard.KeyID ||
 		!equalBytes(response.Card.SPKIDER, response.ExpectedCard.SPKIDER) {
-		return SubjectTokenResult{}, errors.New("forwarded PIVB response card does not match the active workspace route")
+		return SubjectTokenResult{}, routeSecurityError("forwarded PIVB response card does not match the active workspace route")
 	}
 	verified, err := wif.VerifyForwarded(response.IDToken, response.Card.SPKIDER)
 	if err != nil {
-		return SubjectTokenResult{}, fmt.Errorf("verify forwarded PIVB assertion: %w", err)
+		return SubjectTokenResult{}, routeSecurityError("verify forwarded PIVB assertion: " + err.Error())
 	}
 	claims := verified.Claims
-	provider := c.cfg.Provider()
+	provider = cfg.Provider()
 	key, enrolled := keys[response.Card.Serial]
 	if !enrolled || key.JWKKid != response.Card.KeyID || claims.KeyID != response.Card.KeyID {
-		return SubjectTokenResult{}, fmt.Errorf("forwarded PIVB card %d/%s is not enrolled on this origin", response.Card.Serial, response.Card.KeyID)
+		return SubjectTokenResult{}, routeSecurityError(fmt.Sprintf("forwarded PIVB card %d/%s is not enrolled on this origin", response.Card.Serial, response.Card.KeyID))
 	}
 	if claims.Iss != provider.IssuerURI || claims.Aud != provider.OIDCAudience() ||
 		claims.Sub != wif.SubjectPrefix+response.Card.KeyID || claims.Alias != req.Alias ||
 		claims.Target != alias.Target || claims.Serial != strconv.FormatUint(uint64(response.Card.Serial), 10) || claims.Jti == "" {
-		return SubjectTokenResult{}, errors.New("forwarded PIVB assertion claims do not match the requested local configuration")
+		return SubjectTokenResult{}, routeSecurityError("forwarded PIVB assertion claims do not match the requested local configuration")
 	}
 	// Providers backdate iat by one ClockSkew. Allow one additional skew for
 	// an origin clock ahead of the provider and one skew in the other
 	// direction; exp is independently checked against the origin clock.
 	if claims.Exp-claims.Iat != int64(wif.Lifetime/time.Second) || response.ExpirationTime != claims.Exp ||
-		!claims.ExpiresAt().After(c.now().UTC()) || claims.Iat < started.Add(-2*wif.ClockSkew).Unix() ||
-		claims.Iat > c.now().UTC().Add(wif.ClockSkew).Unix() {
-		return SubjectTokenResult{}, errors.New("forwarded PIVB assertion is stale or has an invalid lifetime")
+		!claims.ExpiresAt().After(now().UTC()) || claims.Iat < started.Add(-2*wif.ClockSkew).Unix() ||
+		claims.Iat > now().UTC().Add(wif.ClockSkew).Unix() {
+		return SubjectTokenResult{}, routeFreshnessError("forwarded PIVB assertion is stale or has an invalid lifetime")
 	}
 	if response.Card.KeyID != verified.HeaderKeyID {
-		return SubjectTokenResult{}, errors.New("forwarded PIVB response card does not match the signed token")
+		return SubjectTokenResult{}, routeSecurityError("forwarded PIVB response card does not match the signed token")
 	}
-	c.mu.Lock()
-	c.lastSign = &SignEvent{
-		Alias: req.Alias, Target: alias.Target, Serial: response.Card.Serial, KeyID: response.Card.KeyID,
-		At: c.now().UTC(), Route: "zka-workspace-forwarded", ForwardContext: response.ForwardContext,
-	}
-	c.mu.Unlock()
 	return SubjectTokenResult{
 		IDToken: response.IDToken, ExpiresAt: claims.ExpiresAt(), Serial: response.Card.Serial,
-		KeyID: response.Card.KeyID, SPKIDER: append([]byte(nil), response.Card.SPKIDER...),
+		KeyID: response.Card.KeyID, SPKIDER: append([]byte(nil), response.Card.SPKIDER...), ForwardContext: response.ForwardContext,
 	}, nil
+}
+
+func routeProtocolError(message string) error {
+	return &tokenapi.APIError{Status: 502, Code: tokenapi.CodeConfig, Message: message, Remedy: "upgrade PIVB and ZKA together and re-claim the workspace bundle"}
+}
+
+func routeSecurityError(message string) error {
+	return &tokenapi.APIError{
+		Status: 502, Code: tokenapi.CodeConfig, Message: message, SecurityRelevant: true,
+		Remedy: "inspect the selected ZKA workspace route, provider identity, and enrolled card; release and re-claim the bundle only if the binding is wrong",
+	}
+}
+
+func routeFreshnessError(message string) error {
+	return &tokenapi.APIError{
+		Status: 502, Code: tokenapi.CodeConfig, Message: message,
+		Remedy: "check the origin and provider clocks, then inspect the selected ZKA workspace route before retrying",
+	}
+}
+
+func mapRouteError(err error) error {
+	var apiErr *tokenapi.APIError
+	var protocolErr *forwardapi.ProtocolError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	if errors.As(err, &protocolErr) {
+		return routeProtocolError(protocolErr.Error())
+	}
+	return &tokenapi.APIError{Status: 503, Code: tokenapi.CodeUnavailable, Message: "selected PIVB workspace route is unavailable", Remedy: "check the ZKA workspace claim and route status"}
 }
 
 func (c *Core) Status() Status {

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -10,7 +11,9 @@ import (
 	"time"
 
 	"github.com/xlfe/pivb/internal/agentsession"
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/config"
+	"github.com/xlfe/pivb/internal/tokenapi"
 )
 
 func agentSessionCommand(configPath, wifSocket string, args []string) error {
@@ -38,6 +41,14 @@ func agentSessionCommand(configPath, wifSocket string, args []string) error {
 	if *routeSocket != "" && !filepath.IsAbs(*routeSocket) {
 		return errors.New("--route-socket must be an absolute Unix socket path")
 	}
+	attachmentContext, err := attachment.FromEnvironment(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("%s: %w", tokenapi.CodeRouteRequired, err)
+	}
+	attachmentContext, err = attachment.WithExplicitRoute(attachmentContext, *routeSocket)
+	if err != nil {
+		return fmt.Errorf("%s: %w", tokenapi.CodeRouteRequired, err)
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -48,7 +59,7 @@ func agentSessionCommand(configPath, wifSocket string, args []string) error {
 	}
 	if err := agentsession.Run(agentsession.Options{
 		Config: cfg, Alias: *alias, SourceLabel: *sourceLabel,
-		WIFSocket: wifSocket, RouteSocket: *routeSocket, RuntimeDir: runtimeDir,
+		WIFSocket: wifSocket, Attachment: attachmentContext, RuntimeDir: runtimeDir,
 		Command: args[separator+1:],
 	}); err != nil {
 		return err

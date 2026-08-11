@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/uds"
 	"github.com/xlfe/pivb/internal/wif"
@@ -166,7 +167,10 @@ func envWith(mutate func(map[string]string)) map[string]string {
 // original value for restoration and prevents use from parallel tests.
 func runSubjectToken(t *testing.T, configPath, wifSocket string, args []string, env map[string]string) (string, string, error) {
 	t.Helper()
-	for _, name := range []string{envTokenType, envAudience, envImpersonatedEmail, envOutputFile} {
+	for _, name := range []string{
+		envTokenType, envAudience, envImpersonatedEmail, envOutputFile,
+		attachment.EnvMode, attachment.EnvRouteSocket, attachment.EnvProtocol,
+	} {
 		if value, present := env[name]; present {
 			t.Setenv(name, value)
 			continue
@@ -262,10 +266,65 @@ func TestSubjectTokenSuccess(t *testing.T) {
 				Alias:                   "ro",
 				ExternalAccountAudience: testAudience,
 				ImpersonatedEmail:       testTargetRO,
+				Attachment:              attachment.LocalAllowed(),
 			}
 			if !reflect.DeepEqual(got[0], wantReq) {
 				t.Errorf("daemon received %+v, want configured target %+v", got[0], wantReq)
 			}
+		})
+	}
+}
+
+func TestSubjectTokenProtocolOnePreservesRouteRequiredPolicy(t *testing.T) {
+	fake := &fakeWIFCore{result: core.SubjectTokenResult{
+		IDToken: "h.p.s", ExpiresAt: time.Unix(1785585870, 0), Serial: testSerialA, KeyID: testKidA,
+	}}
+	socket := startWIFServer(t, wifHandler(fake))
+	env := pythonSubjectTokenEnv()
+	env[attachment.EnvMode] = attachment.ModeRouteRequired
+	env[attachment.EnvProtocol] = "1"
+	env[attachment.EnvRouteSocket] = "/run/user/1000/zka/pivb/workspace.sock"
+
+	stdout, stderr, err := runSubjectToken(t, writeConfig(t), socket, []string{"--alias", "ro"}, env)
+	if err != nil || stderr != "" || decodeOneJSON(t, stdout)["success"] != true {
+		t.Fatalf("protocol-1 subject-token = err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	got := fake.received()
+	if len(got) != 1 || !got[0].Attachment.RouteRequired() || got[0].Attachment.Protocol != attachment.ProtocolEnvironment ||
+		got[0].Attachment.RouteSocket != env[attachment.EnvRouteSocket] {
+		t.Fatalf("trusted WIF request lost attachment policy: %#v", got)
+	}
+}
+
+func TestSubjectTokenManagedPolicyFailsBeforeLocalWIF(t *testing.T) {
+	configPath := writeConfig(t)
+	tests := []struct {
+		name string
+		env  map[string]string
+		code string
+	}{
+		{
+			name: "partial protocol one",
+			env: envWith(func(env map[string]string) {
+				env[attachment.EnvMode] = attachment.ModeRouteRequired
+				env[attachment.EnvProtocol] = "1"
+			}),
+			code: wifapi.CodeRouteRequired,
+		},
+		{
+			name: "unsupported protocol two",
+			env: envWith(func(env map[string]string) {
+				env[attachment.EnvMode] = attachment.ModeRouteRequired
+				env[attachment.EnvProtocol] = "2"
+				env[attachment.EnvRouteSocket] = "/run/pivb-route-does-not-exist.sock"
+			}),
+			code: wifapi.CodeRouteRequired,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout, _, err := runSubjectToken(t, configPath, "/run/local-wif-must-not-be-used.sock", []string{"--alias", "ro"}, test.env)
+			assertProtocolError(t, stdout, err, test.code)
 		})
 	}
 }

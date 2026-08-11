@@ -22,9 +22,11 @@ import (
 	"time"
 
 	"github.com/xlfe/pivb/internal/agentsource"
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/tokenapi"
 	"github.com/xlfe/pivb/internal/wif"
 )
 
@@ -255,6 +257,7 @@ func roRequest() SubjectTokenRequest {
 		Alias:                   "ro",
 		ExternalAccountAudience: testExternalAudience,
 		ImpersonatedEmail:       roTarget,
+		Attachment:              attachment.LocalAllowed(),
 	}
 }
 
@@ -263,6 +266,20 @@ func deployRequest() SubjectTokenRequest {
 		Alias:                   "deploy",
 		ExternalAccountAudience: testExternalAudience,
 		ImpersonatedEmail:       deployTarget,
+		Attachment:              attachment.LocalAllowed(),
+	}
+}
+
+func TestSubjectTokenRequiresExplicitAttachmentPolicy(t *testing.T) {
+	c, signer := newTestCore(t, testConfig("session"), serialA)
+	_, err := c.SubjectToken(context.Background(), SubjectTokenRequest{
+		Alias: "ro", ExternalAccountAudience: testExternalAudience, ImpersonatedEmail: roTarget,
+	})
+	if err == nil || !strings.Contains(err.Error(), "attachment policy is required") {
+		t.Fatalf("SubjectToken error = %v, want required attachment policy", err)
+	}
+	if signer.counts != (signerCounts{}) {
+		t.Fatalf("omitted attachment policy reached hardware: %+v", signer.counts)
 	}
 }
 
@@ -461,7 +478,7 @@ func TestSubjectTokenRejectsRequestsConfigurationDoesNotBind(t *testing.T) {
 	}{
 		{
 			name: "unknown alias",
-			req:  SubjectTokenRequest{Alias: "staging", ExternalAccountAudience: testExternalAudience, ImpersonatedEmail: roTarget},
+			req:  SubjectTokenRequest{Alias: "staging", ExternalAccountAudience: testExternalAudience, ImpersonatedEmail: roTarget, Attachment: attachment.LocalAllowed()},
 			check: func(t *testing.T, err error) {
 				t.Helper()
 				var aliasErr *UnknownAliasError
@@ -479,6 +496,7 @@ func TestSubjectTokenRejectsRequestsConfigurationDoesNotBind(t *testing.T) {
 				Alias:                   "ro",
 				ExternalAccountAudience: "//iam.googleapis.com/projects/210987654321/locations/global/workloadIdentityPools/other/providers/other",
 				ImpersonatedEmail:       roTarget,
+				Attachment:              attachment.LocalAllowed(),
 			},
 			check: mismatch("external_account_audience", testExternalAudience),
 		},
@@ -488,6 +506,7 @@ func TestSubjectTokenRejectsRequestsConfigurationDoesNotBind(t *testing.T) {
 				Alias:                   "ro",
 				ExternalAccountAudience: testOIDCAudience,
 				ImpersonatedEmail:       roTarget,
+				Attachment:              attachment.LocalAllowed(),
 			},
 			check: mismatch("external_account_audience", testExternalAudience),
 		},
@@ -497,6 +516,7 @@ func TestSubjectTokenRejectsRequestsConfigurationDoesNotBind(t *testing.T) {
 				Alias:                   "ro",
 				ExternalAccountAudience: testExternalAudience,
 				ImpersonatedEmail:       deployTarget,
+				Attachment:              attachment.LocalAllowed(),
 			},
 			check: mismatch("impersonated_email", roTarget),
 		},
@@ -991,7 +1011,7 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 			c, signer := newTestCore(t, testConfig("session"), serialA)
 			c.SetNowForTest(func() time.Time { return now })
 			req := roRequest()
-			req.RouteSocket = socket
+			req.Attachment = attachment.RouteRequired(attachment.ProtocolEnvironment, socket)
 			result, err := c.SubjectToken(context.Background(), req)
 			if test.wantSuccess {
 				if err != nil {
@@ -1011,6 +1031,17 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 				t.Fatalf("origin verification touched its local card: %+v", signer.counts)
 			}
 			if !test.wantSuccess {
+				var apiErr *tokenapi.APIError
+				if !errors.As(err, &apiErr) || apiErr.Code != tokenapi.CodeConfig {
+					t.Fatalf("hostile response error = %#v, want PIVB_CONFIG", err)
+				}
+				if strings.Contains(apiErr.Remedy, "upgrade PIVB") {
+					t.Fatalf("hostile response was misdiagnosed as version skew: %#v", apiErr)
+				}
+				wantSecurityLog := !strings.Contains(apiErr.Message, "stale or has an invalid lifetime")
+				if apiErr.SecurityRelevant != wantSecurityLog {
+					t.Fatalf("security relevance = %t, want %t for %#v", apiErr.SecurityRelevant, wantSecurityLog, apiErr)
+				}
 				status := c.Status()
 				if status.LastSignAlias != "" || !status.LastSignAt.IsZero() {
 					t.Fatalf("rejected response recorded a sign event: %#v", status)

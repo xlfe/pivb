@@ -16,11 +16,13 @@ import (
 
 	"github.com/xlfe/pivb/internal/agentapi"
 	"github.com/xlfe/pivb/internal/agentsession"
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/cardlease"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/tokenapi"
 	"github.com/xlfe/pivb/internal/uds"
 	"github.com/xlfe/pivb/internal/version"
 	"github.com/xlfe/pivb/internal/wifapi"
@@ -68,7 +70,12 @@ func run(args []string) error {
 	case "version":
 		fmt.Println(version.Value)
 		return nil
+	case "capabilities":
+		return capabilitiesCommand(rest, os.Stdout, os.Stderr)
 	case "serve":
+		if err := rejectProviderCommandAttachment(); err != nil {
+			return err
+		}
 		if len(rest) != 0 {
 			return errors.New("serve takes no arguments")
 		}
@@ -94,6 +101,9 @@ func run(args []string) error {
 	if *controlSocket == "" {
 		return errors.New("XDG_RUNTIME_DIR is not set; pass --control-socket explicitly")
 	}
+	if err := rejectProviderCommandAttachment(); err != nil {
+		return err
+	}
 	client := agentapi.NewClient(*controlSocket)
 	if cmd == "status" {
 		defer client.HTTP.CloseIdleConnections()
@@ -115,6 +125,17 @@ func run(args []string) error {
 	default:
 		usage(global)
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+	return nil
+}
+
+func rejectProviderCommandAttachment() error {
+	ctx, err := attachment.FromEnvironment(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tokenapi.CodeRouteRequired, err)
+	}
+	if ctx.RouteRequired() {
+		return fmt.Errorf("%s: command is unavailable in a route-required attachment", tokenapi.CodeRouteRequired)
 	}
 	return nil
 }
@@ -210,4 +231,5 @@ func usage(fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), "  wif credentials --alias <a> --output <f> --executable <p>   write one credential file")
 	fmt.Fprintln(fs.Output(), "  wif provider-condition                   print provider mapping and condition for gcloud")
 	fmt.Fprintln(fs.Output(), "  version")
+	fmt.Fprintln(fs.Output(), "  capabilities --format=json")
 }

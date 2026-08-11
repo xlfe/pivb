@@ -6,11 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/execsource"
+	"github.com/xlfe/pivb/internal/tokenapi"
 	"github.com/xlfe/pivb/internal/wifapi"
 )
 
@@ -52,6 +55,10 @@ func subjectTokenCommand(configPath, wifSocket string, args []string, stdout, st
 	}
 	if *alias == "" {
 		return report(wifapi.CodeEnv, "invalid subject-token invocation", "--alias is required")
+	}
+	attachmentContext, err := attachment.FromEnvironment(os.Getenv)
+	if err != nil {
+		return report(wifapi.CodeRouteRequired, "managed PIVB attachment is invalid", err.Error())
 	}
 	if wifSocket == "" {
 		return report(wifapi.CodeEnv, "pivb signing socket location is unknown",
@@ -101,12 +108,15 @@ func subjectTokenCommand(configPath, wifSocket string, args []string, stdout, st
 	client := wifapi.NewClient(wifSocket)
 	defer client.HTTP.CloseIdleConnections()
 	resp, err := client.SubjectToken(ctx, wifapi.SubjectTokenRequest{
-		Alias:                   *alias,
-		ExternalAccountAudience: wantAudience,
-		ImpersonatedEmail:       aliasCfg.Target,
+		Alias: *alias, ExternalAccountAudience: wantAudience, ImpersonatedEmail: aliasCfg.Target,
+		RouteSocket: attachmentContext.RouteSocket, RouteRequired: attachmentContext.RouteRequired(),
 	})
 	if err != nil {
-		var apiErr *wifapi.APIError
+		var apiErr *tokenapi.APIError
+		var policyErr *attachment.PolicyError
+		if errors.As(err, &policyErr) {
+			return report(wifapi.CodeRouteRequired, "managed PIVB route was rejected", policyErr.Message)
+		}
 		if errors.As(err, &apiErr) {
 			detail := apiErr.Message
 			if apiErr.Remedy != "" {

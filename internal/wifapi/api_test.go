@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/tokenapi"
 	"github.com/xlfe/pivb/internal/uds"
 )
 
@@ -129,6 +131,7 @@ func TestSubjectTokenForwardsRequestVerbatim(t *testing.T) {
 		Alias:                   "ro",
 		ExternalAccountAudience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pivb-pool/providers/pivb-provider",
 		ImpersonatedEmail:       "readonly-sa@example-project-id.iam.gserviceaccount.com",
+		Attachment:              attachment.LocalAllowed(),
 	}
 	if !reflect.DeepEqual(fake.got, want) {
 		t.Errorf("core request = %+v, want %+v", fake.got, want)
@@ -137,10 +140,32 @@ func TestSubjectTokenForwardsRequestVerbatim(t *testing.T) {
 
 func TestSubjectTokenRejectsRelativeTrustedRoute(t *testing.T) {
 	fake := okCore()
-	body := strings.TrimSuffix(validRequestBody(), "}") + `,"route_socket":"relative.sock"}`
+	body := strings.TrimSuffix(validRequestBody(), "}") + `,"route_socket":"relative.sock","route_required":true}`
 	rec := post(t, quietAPI(fake).Handler(), body)
 	if rec.Code != http.StatusBadRequest || fake.calls != 0 || !strings.Contains(rec.Body.String(), "absolute") {
 		t.Fatalf("relative route response = %d %q, calls=%d", rec.Code, rec.Body.String(), fake.calls)
+	}
+}
+
+func TestSubjectTokenPreservesRouteRequiredPolicy(t *testing.T) {
+	fake := okCore()
+	body := strings.TrimSuffix(validRequestBody(), "}") + `,"route_socket":"/run/user/1000/zka/pivb/workspace.sock","route_required":true}`
+	rec := post(t, quietAPI(fake).Handler(), body)
+	if rec.Code != http.StatusOK || fake.calls != 1 {
+		t.Fatalf("route-required response = %d %q, calls=%d", rec.Code, rec.Body.String(), fake.calls)
+	}
+	if !fake.got.Attachment.RouteRequired() || fake.got.Attachment.Protocol != attachment.ProtocolEnvironment ||
+		fake.got.Attachment.RouteSocket != "/run/user/1000/zka/pivb/workspace.sock" {
+		t.Fatalf("core request lost route-required policy: %#v", fake.got)
+	}
+}
+
+func TestSubjectTokenRejectsRouteWithoutRequiredMarker(t *testing.T) {
+	fake := okCore()
+	body := strings.TrimSuffix(validRequestBody(), "}") + `,"route_socket":"/run/user/1000/zka/pivb/workspace.sock"}`
+	rec := post(t, quietAPI(fake).Handler(), body)
+	if rec.Code != http.StatusBadRequest || fake.calls != 0 || !strings.Contains(rec.Body.String(), CodeRouteRequired) {
+		t.Fatalf("unmarked route response = %d %q, calls=%d", rec.Code, rec.Body.String(), fake.calls)
 	}
 }
 
@@ -252,6 +277,25 @@ func TestSubjectTokenErrorMapping(t *testing.T) {
 				t.Errorf("remedy = %q, want the error's own remedy %q", body.Remedy, tc.wantRemedy)
 			}
 		})
+	}
+}
+
+func TestSecurityRelevantForwardingFailureIsLoggedAsError(t *testing.T) {
+	var journal bytes.Buffer
+	api := &API{
+		Core: failingCore(&tokenapi.APIError{
+			Status: http.StatusBadGateway, Code: tokenapi.CodeConfig,
+			Message: "forwarded assertion signature is invalid", Remedy: "inspect the route", SecurityRelevant: true,
+		}),
+		Logger: slog.New(slog.NewTextHandler(&journal, nil)),
+	}
+	rec := post(t, api.Handler(), validRequestBody())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	logged := journal.String()
+	if !strings.Contains(logged, "level=ERROR") || !strings.Contains(logged, "failed a security check") {
+		t.Fatalf("security rejection log = %q", logged)
 	}
 }
 
@@ -444,7 +488,7 @@ func TestClientSuccess(t *testing.T) {
 	if resp.ExpirationTime != testExpiry {
 		t.Errorf("ExpirationTime = %d, want %d", resp.ExpirationTime, testExpiry)
 	}
-	if got := (core.SubjectTokenRequest{Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience, ImpersonatedEmail: req.ImpersonatedEmail}); !reflect.DeepEqual(fake.got, got) {
+	if got := (core.SubjectTokenRequest{Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience, ImpersonatedEmail: req.ImpersonatedEmail, Attachment: attachment.LocalAllowed()}); !reflect.DeepEqual(fake.got, got) {
 		t.Errorf("core request = %+v, want %+v", fake.got, got)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
@@ -43,6 +44,7 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 	result, err := b.core.SubjectToken(ctx, core.SubjectTokenRequest{
 		Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail: req.ImpersonatedEmail, RequestSource: *req.RequestSource,
+		Attachment:   attachment.LocalAllowed(),
 		ExpectedCard: req.ExpectedCard, ForwardContext: req.ForwardContext,
 	})
 	if err != nil {
@@ -52,7 +54,8 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 		"alias", req.Alias, "target", req.ImpersonatedEmail,
 		"source_label", req.RequestSource.Label, "session_id", req.RequestSource.SessionID,
 		"origin_node", fc.OriginNodeID, "workspace", fc.WorkspaceID, "bundle", fc.Bundle,
-		"claim_generation", fc.ClaimGeneration, "operation_id", fc.OperationID,
+		"claim_generation", fc.ClaimGeneration, "provider_attachment_id", fc.ProviderAttachID,
+		"operation_id", fc.OperationID,
 		"serial", result.Serial, "key_id", result.KeyID)
 	return forwardapi.MintResponse{
 		Version: forwardapi.ProtocolVersion, IDToken: result.IDToken, ExpirationTime: result.ExpiresAt.Unix(),

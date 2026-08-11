@@ -157,6 +157,20 @@ type Client struct {
 	HTTP *http.Client
 }
 
+// TransportError means the selected endpoint could not be reached or read.
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// ProtocolError means the selected endpoint responded but did not speak the
+// negotiated forwarding protocol. Callers expose this as PIVB_CONFIG rather
+// than misdiagnosing it as a transient outage.
+type ProtocolError struct{ Err error }
+
+func (e *ProtocolError) Error() string { return e.Err.Error() }
+func (e *ProtocolError) Unwrap() error { return e.Err }
+
 func NewClient(socket string) *Client {
 	return &Client{HTTP: uds.NewHTTPClient(socket, clientTimeout)}
 }
@@ -175,7 +189,7 @@ func (c *Client) Describe(ctx context.Context) (Description, error) {
 		return out, err
 	}
 	if out.Version != ProtocolVersion || out.ProviderResource == "" || out.IssuerURI == "" || out.Card.Serial == 0 || out.Card.KeyID == "" || len(out.Card.SPKIDER) == 0 {
-		return Description{}, errors.New("PIVB forwarding description is incomplete")
+		return Description{}, &ProtocolError{Err: errors.New("PIVB forwarding description is incomplete")}
 	}
 	return out, nil
 }
@@ -190,7 +204,7 @@ func (c *Client) Policy(ctx context.Context) (Policy, error) {
 		return out, err
 	}
 	if out.Version != ProtocolVersion || out.ProviderResource == "" || out.IssuerURI == "" || len(out.EnrolledKeys) == 0 {
-		return Policy{}, errors.New("PIVB forwarding policy is incomplete")
+		return Policy{}, &ProtocolError{Err: errors.New("PIVB forwarding policy is incomplete")}
 	}
 	return out, nil
 }
@@ -214,7 +228,7 @@ func (c *Client) Mint(ctx context.Context, req MintRequest) (MintResponse, error
 		out.Card.Serial == 0 || out.Card.KeyID == "" || len(out.Card.SPKIDER) == 0 ||
 		out.ExpectedCard.Serial == 0 || out.ExpectedCard.KeyID == "" || len(out.ExpectedCard.SPKIDER) == 0 ||
 		out.ForwardContext.OriginNodeID == "" || out.ForwardContext.WorkspaceID == "" || out.ForwardContext.OperationID == "" {
-		return MintResponse{}, errors.New("PIVB forwarding response is incomplete")
+		return MintResponse{}, &ProtocolError{Err: errors.New("PIVB forwarding response is incomplete")}
 	}
 	return out, nil
 }
@@ -222,34 +236,34 @@ func (c *Client) Mint(ctx context.Context, req MintRequest) (MintResponse, error
 func (c *Client) do(req *http.Request, out any) error {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("call PIVB forwarding socket: %w", err)
+		return &TransportError{Err: fmt.Errorf("call PIVB forwarding socket: %w", err)}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, uds.MaxResponseBody+1))
 	if err != nil {
-		return fmt.Errorf("read PIVB forwarding response: %w", err)
+		return &TransportError{Err: fmt.Errorf("read PIVB forwarding response: %w", err)}
 	}
 	if len(body) > uds.MaxResponseBody {
-		return errors.New("PIVB forwarding response is too large")
+		return &ProtocolError{Err: errors.New("PIVB forwarding response is too large")}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var er tokenapi.ErrorResponse
-		_ = json.Unmarshal(body, &er)
+		decodeErr := json.Unmarshal(body, &er)
 		if er.Error == "" {
 			er.Error = strings.TrimSpace(string(body))
 		}
-		if er.Code == "" {
-			er.Code = tokenapi.CodeInternal
+		if decodeErr != nil || er.Code == "" || er.Error == "" {
+			return &ProtocolError{Err: fmt.Errorf("PIVB forwarding endpoint returned an invalid error response (status %d)", resp.StatusCode)}
 		}
 		return &tokenapi.APIError{Status: resp.StatusCode, Code: er.Code, Message: er.Error, Remedy: er.Remedy}
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(out); err != nil {
-		return fmt.Errorf("decode PIVB forwarding response: %w", err)
+		return &ProtocolError{Err: fmt.Errorf("decode PIVB forwarding response: %w", err)}
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return errors.New("decode PIVB forwarding response: multiple values")
+		return &ProtocolError{Err: errors.New("decode PIVB forwarding response: multiple values")}
 	}
 	return nil
 }

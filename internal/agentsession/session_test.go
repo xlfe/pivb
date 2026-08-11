@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xlfe/pivb/internal/attachment"
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/sessionapi"
@@ -144,7 +145,8 @@ func childCommand(mode, result string, args ...string) ([]string, []string) {
 func baseOptions(runtimeDir string, command, env []string) Options {
 	return Options{
 		Config: runtimeConfig(), Alias: "ro", SourceLabel: "codex:agentic/ro",
-		WIFSocket: filepath.Join(runtimeDir, "absent-wif.sock"), RuntimeDir: runtimeDir,
+		Attachment: attachment.LocalAllowed(),
+		WIFSocket:  filepath.Join(runtimeDir, "absent-wif.sock"), RuntimeDir: runtimeDir,
 		Command: command, Env: env, Stdin: bytes.NewReader(nil), Stdout: io.Discard, Stderr: io.Discard,
 		Random: bytes.NewReader([]byte("0123456789abcdef")),
 	}
@@ -239,6 +241,7 @@ func TestRunRejectsInvalidPreconditions(t *testing.T) {
 	}{
 		{"nil config", func(o *Options) { o.Config = nil }, "loaded configuration"},
 		{"unknown alias", func(o *Options) { o.Alias = "deploy" }, "not configured"},
+		{"missing attachment policy", func(o *Options) { o.Attachment = attachment.Context{} }, "attachment policy is required"},
 		{"missing WIF socket", func(o *Options) { o.WIFSocket = "" }, "socket location"},
 		{"relative route socket", func(o *Options) { o.RouteSocket = "relative.sock" }, "route socket must be absolute"},
 		{"empty command", func(o *Options) { o.Command = nil }, "child command"},
