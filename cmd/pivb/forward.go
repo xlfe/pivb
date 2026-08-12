@@ -36,9 +36,7 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 		return forwardapi.MintResponse{}, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: "forwarded PIVB request lacks source or claimed card identity", Remedy: "release and re-claim the PIVB credential bundle"}
 	}
 	fc := req.ForwardContext
-	if !validForwardID(fc.OriginNodeID) || !validForwardID(fc.WorkspaceID) || !validForwardName(fc.Bundle) ||
-		fc.ClaimGeneration == 0 || !validForwardID(fc.ProviderNodeID) || !validForwardID(fc.OperationID) ||
-		fc.ProviderAttachID != "" && !validForwardID(fc.ProviderAttachID) {
+	if !validForwardContext(fc) {
 		return forwardapi.MintResponse{}, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: "forwarded PIVB request lacks authenticated ZKA context", Remedy: "upgrade and re-claim the PIVB credential bundle"}
 	}
 	result, err := b.core.SubjectToken(ctx, core.SubjectTokenRequest{
@@ -63,31 +61,6 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 		ExpectedCard:   req.ExpectedCard,
 		ForwardContext: req.ForwardContext,
 	}, nil
-}
-
-func validForwardID(value string) bool {
-	if len(value) != 32 {
-		return false
-	}
-	for _, r := range value {
-		if r < '0' || r > '9' && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
-}
-
-func validForwardName(value string) bool {
-	if len(value) == 0 || len(value) > 64 {
-		return false
-	}
-	for i, r := range value {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || i > 0 && (r == '.' || r == '_' || r == '-') {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 func mapForwardError(err error) *tokenapi.APIError {
