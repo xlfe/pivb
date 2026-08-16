@@ -113,7 +113,7 @@ func TestNewJTI(t *testing.T) {
 
 func TestNewClaimsGolden(t *testing.T) {
 	now := time.Unix(testNowUnix, 0).UTC()
-	claims, err := wif.NewClaims(testProvider, "ro", testTarget, serialA, kidA, testJTI, now)
+	claims, err := wif.NewClaims(testProvider, "ro", testTarget, serialA, kidA, testJTI, now, wif.DefaultLifetime)
 	if err != nil {
 		t.Fatalf("NewClaims: %v", err)
 	}
@@ -133,8 +133,8 @@ func TestNewClaimsGolden(t *testing.T) {
 	if claims != want {
 		t.Fatalf("NewClaims =\n %+v\nwant\n %+v", claims, want)
 	}
-	if claims.Exp-claims.Iat != int64(wif.Lifetime/time.Second) {
-		t.Errorf("exp-iat = %d, want %d", claims.Exp-claims.Iat, int64(wif.Lifetime/time.Second))
+	if claims.Exp-claims.Iat != int64(wif.DefaultLifetime/time.Second) {
+		t.Errorf("exp-iat = %d, want %d", claims.Exp-claims.Iat, int64(wif.DefaultLifetime/time.Second))
 	}
 	if claims.Iat != now.Add(-wif.ClockSkew).Unix() {
 		t.Errorf("iat = %d, want now-ClockSkew = %d", claims.Iat, now.Add(-wif.ClockSkew).Unix())
@@ -147,24 +147,50 @@ func TestNewClaimsGolden(t *testing.T) {
 	}
 }
 
+// TestNewClaimsHonoursLifetime pins exp to iat plus exactly the lifetime the
+// alias configured, at both ends of the permitted range. iat is unaffected by
+// the lifetime: a longer assertion starts at the same instant and ends later.
+func TestNewClaimsHonoursLifetime(t *testing.T) {
+	now := time.Unix(testNowUnix, 0).UTC()
+	for _, lifetime := range []time.Duration{wif.DefaultLifetime, 900 * time.Second, wif.MaxLifetime} {
+		t.Run(lifetime.String(), func(t *testing.T) {
+			claims, err := wif.NewClaims(testProvider, "ro", testTarget, serialA, kidA, testJTI, now, lifetime)
+			if err != nil {
+				t.Fatalf("NewClaims: %v", err)
+			}
+			if want := now.Add(-wif.ClockSkew).Unix(); claims.Iat != want {
+				t.Errorf("iat = %d, want now-ClockSkew = %d", claims.Iat, want)
+			}
+			if want := int64(lifetime / time.Second); claims.Exp-claims.Iat != want {
+				t.Errorf("exp-iat = %d, want %d", claims.Exp-claims.Iat, want)
+			}
+			if want := claims.Iat + int64(lifetime/time.Second); claims.Exp != want {
+				t.Errorf("exp = %d, want %d", claims.Exp, want)
+			}
+		})
+	}
+}
+
 func TestNewClaimsFailsClosed(t *testing.T) {
 	type args struct {
-		p      wif.Provider
-		alias  string
-		target string
-		serial uint32
-		keyID  string
-		jti    string
-		now    time.Time
+		p        wif.Provider
+		alias    string
+		target   string
+		serial   uint32
+		keyID    string
+		jti      string
+		now      time.Time
+		lifetime time.Duration
 	}
 	base := args{
-		p:      testProvider,
-		alias:  "ro",
-		target: testTarget,
-		serial: serialA,
-		keyID:  kidA,
-		jti:    testJTI,
-		now:    time.Unix(testNowUnix, 0).UTC(),
+		p:        testProvider,
+		alias:    "ro",
+		target:   testTarget,
+		serial:   serialA,
+		keyID:    kidA,
+		jti:      testJTI,
+		now:      time.Unix(testNowUnix, 0).UTC(),
+		lifetime: wif.DefaultLifetime,
 	}
 
 	tests := []struct {
@@ -182,12 +208,15 @@ func TestNewClaimsFailsClosed(t *testing.T) {
 		{"no key id", func(a *args) { a.keyID = "" }, "key ID is required"},
 		{"no jti", func(a *args) { a.jti = "" }, "jti is required"},
 		{"zero time", func(a *args) { a.now = time.Time{} }, "signing time is required"},
+		{"zero lifetime", func(a *args) { a.lifetime = 0 }, "lifetime 0s is outside the permitted 5m0s..1h0m0s"},
+		{"lifetime one second under the default", func(a *args) { a.lifetime = 299 * time.Second }, "lifetime 4m59s is outside the permitted"},
+		{"lifetime one second over the ceiling", func(a *args) { a.lifetime = 3601 * time.Second }, "lifetime 1h0m1s is outside the permitted"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			a := base
 			tc.mutate(&a)
-			claims, err := wif.NewClaims(a.p, a.alias, a.target, a.serial, a.keyID, a.jti, a.now)
+			claims, err := wif.NewClaims(a.p, a.alias, a.target, a.serial, a.keyID, a.jti, a.now, a.lifetime)
 			if claims != (wif.Claims{}) {
 				t.Fatalf("expected zero claims on failure, got %+v", claims)
 			}
@@ -269,7 +298,7 @@ func TestSignAndVerifyEndToEnd(t *testing.T) {
 		t.Fatalf("RSAPublicKey: %v", err)
 	}
 
-	claims, err := wif.NewClaims(testProvider, "ro", testTarget, serialA, kidA, testJTI, time.Unix(testNowUnix, 0).UTC())
+	claims, err := wif.NewClaims(testProvider, "ro", testTarget, serialA, kidA, testJTI, time.Unix(testNowUnix, 0).UTC(), wif.DefaultLifetime)
 	if err != nil {
 		t.Fatalf("NewClaims: %v", err)
 	}

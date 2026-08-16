@@ -26,6 +26,12 @@ const (
 	defaultLifetimeS = 3600
 	minLifetimeS     = 600
 	maxLifetimeS     = 3600
+	// The assertion lifetime an alias may configure. The floor is also the
+	// default; the ceiling is wif's absolute one, which claim construction
+	// enforces again.
+	defaultAssertionLifetimeS = int(wif.DefaultLifetime / time.Second)
+	minAssertionLifetimeS     = defaultAssertionLifetimeS
+	maxAssertionLifetimeS     = int(wif.MaxLifetime / time.Second)
 	// minRemainingValidityS is the validity a reused assertion must still have
 	// left when it is served, so it can complete a full STS exchange. It is the
 	// same floor internal/core enforces at serve time (reuseValidityFloor).
@@ -86,13 +92,32 @@ type Alias struct {
 	// byte-identical requests without another one. Zero, the default, means
 	// every credential costs a touch.
 	AssertionReuseS int `toml:"assertion_reuse_s"`
+	// AssertionLifetimeS is how long one minted assertion stays exchangeable
+	// for Google access tokens. Load defaults it; zero survives only in a
+	// hand-built struct and reads as the default.
+	AssertionLifetimeS int `toml:"assertion_lifetime_s"`
 }
 
 // aliasAssertionLifetimeS is the validity of one minted assertion in seconds.
-// Every alias shares wif.Lifetime today; a later change makes it per-alias,
-// which is why the reuse bound is already expressed as a function of the alias
-// rather than of a package constant.
-func aliasAssertionLifetimeS(Alias) int { return int(wif.Lifetime / time.Second) }
+// Load's defaulting pass fills the field in, so a zero here is a configuration
+// that never went through it.
+func aliasAssertionLifetimeS(alias Alias) int {
+	if alias.AssertionLifetimeS <= 0 {
+		return defaultAssertionLifetimeS
+	}
+	return alias.AssertionLifetimeS
+}
+
+// maxAssertionLifetimeSFor is the longest assertion an alias may configure: the
+// absolute ceiling, tightened to the alias's own access-token lifetime so one
+// touch's assertion never outlives the credential it buys. A lifetime_s that is
+// itself out of range reports itself and does not also distort this bound.
+func maxAssertionLifetimeSFor(alias Alias) int {
+	if alias.LifetimeS >= minLifetimeS && alias.LifetimeS < maxAssertionLifetimeS {
+		return alias.LifetimeS
+	}
+	return maxAssertionLifetimeS
+}
 
 // maxAssertionReuseS is the largest reuse window an alias may configure. The
 // headroom keeps every served assertion at least minRemainingValidityS from
@@ -177,6 +202,9 @@ func (c *Config) applyDefaults() {
 		}
 		if alias.LifetimeS == 0 {
 			alias.LifetimeS = defaultLifetimeS
+		}
+		if alias.AssertionLifetimeS == 0 {
+			alias.AssertionLifetimeS = defaultAssertionLifetimeS
 		}
 		c.Aliases[name] = alias
 	}
@@ -264,6 +292,10 @@ func (c *Config) Validate() error {
 		}
 		if alias.LifetimeS < minLifetimeS || alias.LifetimeS > maxLifetimeS {
 			fail("config key %q must be between %d and %d seconds", prefix+".lifetime_s", minLifetimeS, maxLifetimeS)
+		}
+		if lifetime, maximum := aliasAssertionLifetimeS(alias), maxAssertionLifetimeSFor(alias); lifetime < minAssertionLifetimeS || lifetime > maximum {
+			fail("config key %q must be between %d and %d seconds (the lesser of the %ds ceiling and config key %q, so one touch's assertion never outlives the access token it buys), got %d",
+				prefix+".assertion_lifetime_s", minAssertionLifetimeS, maximum, maxAssertionLifetimeS, prefix+".lifetime_s", lifetime)
 		}
 		if maximum := maxAssertionReuseS(alias); alias.AssertionReuseS < 0 || alias.AssertionReuseS > maximum {
 			fail("config key %q must be between 0 and %d seconds (%ds assertion lifetime − %ds iat backdating − %ds minimum remaining validity), got %d",

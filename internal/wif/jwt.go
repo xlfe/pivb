@@ -1,6 +1,6 @@
 // Package wif implements the OIDC subject-token, JWKS, and credential-file
 // primitives for Google Workload Identity Federation with executable-sourced
-// credentials. It performs no I/O with Google: pivb only mints five-minute
+// credentials. It performs no I/O with Google: pivb only mints short-lived
 // RS256 assertions; STS exchange and impersonation belong to the calling
 // Google auth library.
 package wif
@@ -29,13 +29,22 @@ const (
 	// SubjectPrefix namespaces every federated subject to an enrolled key.
 	SubjectPrefix = "pivb-key:"
 
-	// Lifetime is the hard-coded validity window of a subject token. It is a
-	// security cap, not a tunable.
-	Lifetime = 300 * time.Second
+	// DefaultLifetime is the validity of one assertion when the alias does not
+	// configure its own. An alias may raise it up to MaxLifetime through
+	// assertion_lifetime_s.
+	DefaultLifetime = 300 * time.Second
+
+	// MaxLifetime is the absolute ceiling on assertion validity, enforced here
+	// at claim construction so no configuration path can exceed it. Each extra
+	// second extends the horizon one touch authorises: an assertion stays
+	// exchangeable for its whole life, and the access token it buys lives on
+	// after that, so the horizon is assertion lifetime plus the target's
+	// lifetime_s.
+	MaxLifetime = 3600 * time.Second
 
 	// ClockSkew backdates iat so a slightly slow verifier clock still accepts
-	// a freshly signed token. exp remains iat+Lifetime, so the usable window
-	// after signing is Lifetime-ClockSkew.
+	// a freshly signed token. exp remains iat plus the assertion's lifetime, so
+	// the usable window after signing is that lifetime less one ClockSkew.
 	ClockSkew = 30 * time.Second
 
 	jtiBytes = 16
@@ -114,8 +123,10 @@ func NewJTI(random io.Reader) (string, error) {
 }
 
 // NewClaims builds the claim set for one enrolled key and one configured
-// alias/target pair. Every field is required; empty inputs fail closed.
-func NewClaims(p Provider, alias, target string, serial uint32, keyID, jti string, now time.Time) (Claims, error) {
+// alias/target pair. Every field is required; empty inputs fail closed. The
+// lifetime is the alias's configured assertion validity and is bounded here
+// rather than trusted from the caller.
+func NewClaims(p Provider, alias, target string, serial uint32, keyID, jti string, now time.Time, lifetime time.Duration) (Claims, error) {
 	switch {
 	case p.ProjectNumber == "" || p.PoolID == "" || p.ProviderID == "":
 		return Claims{}, errors.New("wif provider is incompletely configured")
@@ -131,6 +142,8 @@ func NewClaims(p Provider, alias, target string, serial uint32, keyID, jti strin
 		return Claims{}, errors.New("subject-token jti is required")
 	case now.IsZero():
 		return Claims{}, errors.New("subject-token signing time is required")
+	case lifetime < DefaultLifetime || lifetime > MaxLifetime:
+		return Claims{}, fmt.Errorf("subject-token lifetime %s is outside the permitted %s..%s", lifetime, DefaultLifetime, MaxLifetime)
 	}
 	iat := now.Add(-ClockSkew).Unix()
 	return Claims{
@@ -138,7 +151,7 @@ func NewClaims(p Provider, alias, target string, serial uint32, keyID, jti strin
 		Sub:    SubjectPrefix + keyID,
 		Aud:    p.OIDCAudience(),
 		Iat:    iat,
-		Exp:    iat + int64(Lifetime/time.Second),
+		Exp:    iat + int64(lifetime/time.Second),
 		Jti:    jti,
 		Alias:  alias,
 		Target: target,

@@ -255,6 +255,12 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if got := cfg.Aliases["ro"].LifetimeS; got != defaultLifetimeS {
 		t.Errorf("default alias lifetime_s = %d, want %d", got, defaultLifetimeS)
 	}
+	if got := cfg.Aliases["ro"].AssertionLifetimeS; got != 300 {
+		t.Errorf("default alias assertion_lifetime_s = %d, want 300", got)
+	}
+	if got := cfg.Aliases["ro"].AssertionReuseS; got != 0 {
+		t.Errorf("default alias assertion_reuse_s = %d, want 0", got)
+	}
 }
 
 func TestLoadRejectsRelativeGnuPGHomeButDoesNotRequireItToExist(t *testing.T) {
@@ -450,7 +456,77 @@ func TestLoadRejectsInvalidAliases(t *testing.T) {
 			withAliasLine("assertion_reuse_s = -1"),
 			[]string{`"aliases.ro.assertion_reuse_s"`, "got -1"},
 		},
+		{
+			"assertion lifetime one second under the floor",
+			withAliasLine("assertion_lifetime_s = 299"),
+			[]string{`"aliases.ro.assertion_lifetime_s"`, "between 300 and 3600 seconds", `"aliases.ro.lifetime_s"`, "got 299"},
+		},
+		{
+			"assertion lifetime one second over the ceiling",
+			withAliasLine("assertion_lifetime_s = 3601"),
+			[]string{`"aliases.ro.assertion_lifetime_s"`, "between 300 and 3600 seconds", "got 3601"},
+		},
+		{
+			// The ceiling is the alias's own access-token lifetime whenever that
+			// is the smaller of the two, so the message has to name it.
+			"assertion lifetime past a shortened access-token lifetime",
+			setValue(t, withAliasLine("assertion_lifetime_s = 601"), "lifetime_s", "600"),
+			[]string{`"aliases.ro.assertion_lifetime_s"`, "between 300 and 600 seconds",
+				"3600s ceiling", `"aliases.ro.lifetime_s"`, "got 601"},
+		},
+		{
+			// The reuse bound is derived from the assertion lifetime, so raising
+			// one moves the other and the arithmetic must say so.
+			"assertion reuse past a raised assertion lifetime",
+			withAliasLine("assertion_lifetime_s = 900") + "assertion_reuse_s = 811\n",
+			[]string{`"aliases.ro.assertion_reuse_s"`, "between 0 and 810 seconds",
+				"900s assertion lifetime", "30s iat backdating", "60s minimum remaining validity", "got 811"},
+		},
 	})
+}
+
+// TestAssertionLifetimeBounds pins the default and both accepting edges of the
+// per-alias assertion validity, including the edge that the alias's own
+// lifetime_s tightens.
+func TestAssertionLifetimeBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		toml string
+		want int
+	}{
+		{"absent", baseConfig(), 300},
+		{"the floor", withAliasLine("assertion_lifetime_s = 300"), 300},
+		{"an hour", withAliasLine("assertion_lifetime_s = 3600"), 3600},
+		{"exactly the access-token lifetime", setValue(t, withAliasLine("assertion_lifetime_s = 600"), "lifetime_s", "600"), 600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadFrom(t, tc.toml)
+			if err != nil {
+				t.Fatalf("Load rejected a valid assertion lifetime: %v", err)
+			}
+			if got := cfg.Aliases["ro"].AssertionLifetimeS; got != tc.want {
+				t.Errorf("assertion_lifetime_s = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAssertionReuseBoundScalesWithLifetime is the interplay between the two
+// per-alias knobs: the reuse window an operator may buy is the assertion's own
+// validity less the 30 seconds spent backdating iat and the 60 a served
+// assertion must keep.
+func TestAssertionReuseBoundScalesWithLifetime(t *testing.T) {
+	cfg, err := loadFrom(t, withAliasLine("assertion_lifetime_s = 900")+"assertion_reuse_s = 810\n")
+	if err != nil {
+		t.Fatalf("Load rejected the whole reuse bound of a 900s assertion: %v", err)
+	}
+	alias := cfg.Aliases["ro"]
+	if alias.AssertionLifetimeS != 900 || alias.AssertionReuseS != 810 {
+		t.Fatalf("alias ro = lifetime %ds reuse %ds, want 900/810", alias.AssertionLifetimeS, alias.AssertionReuseS)
+	}
+	if got := maxAssertionReuseS(alias); got != 810 {
+		t.Errorf("maxAssertionReuseS = %d, want 810", got)
+	}
 }
 
 // TestAssertionReuseBounds pins both edges of the consent window an alias may

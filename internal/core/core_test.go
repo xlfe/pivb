@@ -60,7 +60,7 @@ const (
 	testJTI     = "MDEyMzQ1Njc4OWFiY2RlZg"
 
 	// The fixed signing instant, and the iat/exp it must produce: iat is
-	// backdated by wif.ClockSkew and exp is iat plus wif.Lifetime.
+	// backdated by wif.ClockSkew and exp is iat plus wif.DefaultLifetime.
 	testNowUnix = 1785585600
 	testIatUnix = 1785585570
 	testExpUnix = 1785585870
@@ -622,6 +622,92 @@ func TestSubjectTokenMintsAnAssertionBoundToTheLiveKey(t *testing.T) {
 	}
 }
 
+// lifetimeConfig is testConfig with one alias's assertion validity raised.
+func lifetimeConfig(mode string, lifetimeS int) *config.Config {
+	cfg := testConfig(mode)
+	alias := cfg.Aliases["ro"]
+	alias.AssertionLifetimeS = lifetimeS
+	cfg.Aliases["ro"] = alias
+	return cfg
+}
+
+// TestAssertionLifetimeIsPerAlias moves the two things a raised
+// assertion_lifetime_s has to move together: the exp a verifier reads, and the
+// prompt the operator answers before the key signs it.
+func TestAssertionLifetimeIsPerAlias(t *testing.T) {
+	c, signer := newTestCore(t, lifetimeConfig("session", 900), serialA)
+	fixClock(c)
+	unlockOK(t, c, pinA)
+
+	result := mintOK(t, c, roRequest())
+	token := parseToken(t, result.IDToken)
+	claimSeconds := func(name string) int64 {
+		t.Helper()
+		number, ok := token.claims[name].(json.Number)
+		if !ok {
+			t.Fatalf("claim %q = %#v, want a number", name, token.claims[name])
+		}
+		value, err := number.Int64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	// A longer assertion starts at the same backdated instant and ends later:
+	// the lifetime moves exp alone.
+	if got := claimSeconds("iat"); got != testIatUnix {
+		t.Errorf("iat = %d, want %d", got, testIatUnix)
+	}
+	if got := claimSeconds("exp") - claimSeconds("iat"); got != 900 {
+		t.Errorf("exp-iat = %d, want 900", got)
+	}
+	if want := time.Unix(testIatUnix+900, 0).UTC(); !result.ExpiresAt.Equal(want) {
+		t.Errorf("result.ExpiresAt = %s, want %s", result.ExpiresAt, want)
+	}
+	if want := "assertion valid 15m0s"; !strings.Contains(signer.snapshotLabels()[0], want) {
+		t.Errorf("touch prompt %q does not name the assertion's validity (%q)", signer.snapshotLabels()[0], want)
+	}
+
+	// The deploy alias is untouched, so a raised lifetime is per-alias rather
+	// than per-daemon.
+	deploy := mintOK(t, c, deployRequest())
+	if want := time.Unix(testExpUnix, 0).UTC(); !deploy.ExpiresAt.Equal(want) {
+		t.Errorf("deploy ExpiresAt = %s, want the default %s", deploy.ExpiresAt, want)
+	}
+}
+
+// TestTouchPromptNamesReuseThenValidity pins the whole grant one touch buys, in
+// the order the operator reads it: how long it stays touch-free, then how long
+// what it signs remains exchangeable.
+func TestTouchPromptNamesReuseThenValidity(t *testing.T) {
+	cfg := lifetimeConfig("session", 900)
+	alias := cfg.Aliases["ro"]
+	alias.AssertionReuseS = 210
+	cfg.Aliases["ro"] = alias
+
+	c, signer := newTestCore(t, cfg, serialA)
+	startTickClock(c)
+	unlockOK(t, c, pinA)
+	mintOK(t, c, roRequest())
+
+	labels := signer.snapshotLabels()
+	if len(labels) != 1 {
+		t.Fatalf("touch prompts = %q, want one", labels)
+	}
+	if want := "authorises ro touch-free for 3m30s\nassertion valid 15m0s"; !strings.Contains(labels[0], want) {
+		t.Errorf("touch prompt = %q, want it to contain %q", labels[0], want)
+	}
+
+	// A default lifetime adds no line at all; the prompt is what it always was.
+	plain, plainSigner := newTestCore(t, testConfig("session"), serialA)
+	startTickClock(plain)
+	unlockOK(t, plain, pinA)
+	mintOK(t, plain, roRequest())
+	if got := plainSigner.snapshotLabels()[0]; got != "ro → "+roTarget+" (local-wif)" {
+		t.Errorf("default-lifetime touch prompt = %q", got)
+	}
+}
+
 func TestSubjectTokenRejectsRequestsConfigurationDoesNotBind(t *testing.T) {
 	c, signer := newTestCore(t, testConfig("session"), serialA)
 	fixClock(c)
@@ -819,6 +905,29 @@ func TestForwardDescriptionAndExpectedCardAreBoundToLiveSession(t *testing.T) {
 	}
 	if signer.counts.signatures != 0 {
 		t.Fatal("mismatched claimed card was allowed to sign")
+	}
+}
+
+// TestForwardDiscoveryAdvertisesEffectiveAssertionLifetimes keeps both halves of
+// provider discovery honest about what the provider will actually mint. The
+// value is always the effective one, so an origin comparing it against its own
+// configuration never has to guess what an absent field meant.
+func TestForwardDiscoveryAdvertisesEffectiveAssertionLifetimes(t *testing.T) {
+	c, _ := newTestCore(t, lifetimeConfig("session", 900), serialA)
+	description, err := c.DescribeForwardProvider(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, aliases := range map[string]map[string]forwardapi.AliasBinding{
+		"policy":      c.ForwardPolicy().Aliases,
+		"description": description.Aliases,
+	} {
+		if got := aliases["ro"].AssertionLifetimeS; got != 900 {
+			t.Errorf("%s advertises ro assertion_lifetime_s = %d, want 900", name, got)
+		}
+		if got := aliases["deploy"].AssertionLifetimeS; got != 300 {
+			t.Errorf("%s advertises deploy assertion_lifetime_s = %d, want the default 300", name, got)
+		}
 	}
 }
 
@@ -1255,11 +1364,19 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 	type responseCase struct {
 		mutateClaims   func(*wif.Claims)
 		mutateResponse func(*forwardapi.MintResponse)
-		fixture        fixtureKey
-		serial         uint32
-		kid            string
-		expected       forwardapi.CardIdentity
-		wantSuccess    bool
+		// originAlias rewrites the origin's own configuration for alias ro,
+		// which is what the forwarded assertion is checked against.
+		originAlias func(*config.Alias)
+		// providerLifetime is the validity the provider minted with. Zero is
+		// the default, which is also what an unmodified origin configures.
+		providerLifetime time.Duration
+		fixture          fixtureKey
+		serial           uint32
+		kid              string
+		expected         forwardapi.CardIdentity
+		wantSuccess      bool
+		wantMessage      []string
+		wantRemedy       string
 	}
 	tests := map[string]responseCase{
 		"valid response":                 {wantSuccess: true},
@@ -1274,15 +1391,15 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 		"invalid lifetime":               {mutateClaims: func(c *wif.Claims) { c.Exp++ }},
 		"expired": {mutateClaims: func(c *wif.Claims) {
 			c.Exp = now.Unix()
-			c.Iat = c.Exp - int64(wif.Lifetime/time.Second)
+			c.Iat = c.Exp - int64(wif.DefaultLifetime/time.Second)
 		}},
 		"pre-dated iat": {mutateClaims: func(c *wif.Claims) {
 			c.Iat = now.Add(-2*wif.ClockSkew - time.Second).Unix()
-			c.Exp = c.Iat + int64(wif.Lifetime/time.Second)
+			c.Exp = c.Iat + int64(wif.DefaultLifetime/time.Second)
 		}},
 		"future iat": {mutateClaims: func(c *wif.Claims) {
 			c.Iat = now.Add(wif.ClockSkew + time.Second).Unix()
-			c.Exp = c.Iat + int64(wif.Lifetime/time.Second)
+			c.Exp = c.Iat + int64(wif.DefaultLifetime/time.Second)
 		}},
 		"expiration envelope disagrees": {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpirationTime++ }},
 		"different enrolled fleet card": {fixture: fixtureB, serial: serialB, kid: kidB, expected: cardA},
@@ -1298,6 +1415,46 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 		"active route serial pin disagrees": {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpectedCard.Serial = serialB }},
 		"active route key pin disagrees":    {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpectedCard.KeyID = kidB }},
 		"active route SPKI pin disagrees":   {mutateResponse: func(r *forwardapi.MintResponse) { r.ExpectedCard.SPKIDER = append([]byte(nil), cardB.SPKIDER...) }},
+		// Assertion validity is configured at both ends of the route. A
+		// provider minting a longer one than this origin configures is skew
+		// the operator has to reconcile, so the rejection names both numbers
+		// and the key that carries them.
+		"provider mints a lifetime this origin does not configure": {
+			providerLifetime: 900 * time.Second,
+			wantMessage:      []string{`alias "ro"`, "valid for 900s", "assertion_lifetime_s = 300"},
+			wantRemedy:       "assertion_lifetime_s",
+		},
+		"provider and origin agree on a raised lifetime": {
+			providerLifetime: 900 * time.Second,
+			originAlias:      func(a *config.Alias) { a.AssertionLifetimeS = 900 },
+			wantSuccess:      true,
+		},
+		// An origin that opted this alias into reuse accepts an assertion that
+		// much more cache-aged, because the provider may answer from the
+		// signature its own window authorised. The bound is inclusive.
+		"reuse-aged iat exactly on the origin's widened bound": {
+			originAlias: func(a *config.Alias) { a.AssertionReuseS = 120 },
+			mutateClaims: func(c *wif.Claims) {
+				c.Iat = now.Add(-2*wif.ClockSkew - 120*time.Second).Unix()
+				c.Exp = c.Iat + int64(wif.DefaultLifetime/time.Second)
+			},
+			wantSuccess: true,
+		},
+		"reuse-aged iat one second past the origin's widened bound": {
+			originAlias: func(a *config.Alias) { a.AssertionReuseS = 120 },
+			mutateClaims: func(c *wif.Claims) {
+				c.Iat = now.Add(-2*wif.ClockSkew - 121*time.Second).Unix()
+				c.Exp = c.Iat + int64(wif.DefaultLifetime/time.Second)
+			},
+		},
+		// Without that opt-in the bound is the two-skew one it has always been,
+		// so an assertion the provider cached forty seconds ago is still stale.
+		"cache-aged iat with no reuse configured": {
+			mutateClaims: func(c *wif.Claims) {
+				c.Iat = now.Add(-40*time.Second - wif.ClockSkew).Unix()
+				c.Exp = c.Iat + int64(wif.DefaultLifetime/time.Second)
+			},
+		},
 	}
 
 	for name, test := range tests {
@@ -1306,7 +1463,17 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 			if fixture.cert == nil {
 				fixture, serial, kid = fixtureA, serialA, kidA
 			}
-			claims, err := wif.NewClaims(testConfig("session").Provider(), "ro", roTarget, serial, kid, testJTI, now)
+			cfg := testConfig("session")
+			if test.originAlias != nil {
+				alias := cfg.Aliases["ro"]
+				test.originAlias(&alias)
+				cfg.Aliases["ro"] = alias
+			}
+			providerLifetime := test.providerLifetime
+			if providerLifetime == 0 {
+				providerLifetime = wif.DefaultLifetime
+			}
+			claims, err := wif.NewClaims(cfg.Provider(), "ro", roTarget, serial, kid, testJTI, now, providerLifetime)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1338,7 +1505,7 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 				test.mutateResponse(&response)
 			}
 			socket := serveForwardResponse(t, response)
-			c, signer := newTestCore(t, testConfig("session"), serialA)
+			c, signer := newTestCore(t, cfg, serialA)
 			c.SetNowForTest(func() time.Time { return now })
 			req := roRequest()
 			req.Attachment = attachment.RouteRequired(attachment.ProtocolEnvironment, socket)
@@ -1368,9 +1535,21 @@ func TestForwardSubjectTokenRejectsHostileProviderResponses(t *testing.T) {
 				if strings.Contains(apiErr.Remedy, "upgrade PIVB") {
 					t.Fatalf("hostile response was misdiagnosed as version skew: %#v", apiErr)
 				}
-				wantSecurityLog := !strings.Contains(apiErr.Message, "stale or has an invalid lifetime")
-				if apiErr.SecurityRelevant != wantSecurityLog {
-					t.Fatalf("security relevance = %t, want %t for %#v", apiErr.SecurityRelevant, wantSecurityLog, apiErr)
+				for _, want := range test.wantMessage {
+					if !strings.Contains(apiErr.Message, want) {
+						t.Errorf("rejection %q does not name %q", apiErr.Message, want)
+					}
+				}
+				if test.wantRemedy != "" && !strings.Contains(apiErr.Remedy, test.wantRemedy) {
+					t.Errorf("rejection remedy %q does not name %q", apiErr.Remedy, test.wantRemedy)
+				}
+				// A stale assertion and a lifetime the two ends configure
+				// differently are both configuration skew, not evidence of a
+				// hostile provider. Every other rejection here is.
+				configSkew := strings.Contains(apiErr.Message, "assertion is stale") ||
+					strings.Contains(apiErr.Message, "configures assertion_lifetime_s")
+				if apiErr.SecurityRelevant == configSkew {
+					t.Fatalf("security relevance = %t, want %t for %#v", apiErr.SecurityRelevant, !configSkew, apiErr)
 				}
 				status := c.Status()
 				if status.LastSignAlias != "" || !status.LastSignAt.IsZero() {

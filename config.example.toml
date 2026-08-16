@@ -35,9 +35,20 @@ jwk_kid = "replace-with-43-char-base64url-spki-digest1"
 # agent session, attachment policy, claimed card, and workspace claim
 # generation. Anything else still asks for a touch, the touch prompt states
 # what it is granting, and the window is announced 60 seconds before it closes.
-# The bound is 210 seconds: an assertion lives 300 seconds, 30 of which are
+# The bound is assertion_lifetime_s minus 90: 30 seconds of an assertion are
 # already spent on iat backdating when it is signed, and a served assertion
-# must keep at least 60 seconds of validity.
+# must keep at least 60 seconds of validity. At the default 300s lifetime that
+# is 210 seconds; at 900 it is 810.
+#
+# assertion_lifetime_s is how long one minted assertion stays exchangeable for
+# Google access tokens, 300..min(3600, lifetime_s), default 300. Raising it is
+# the other half of the same consent: one touch's assertion keeps buying access
+# tokens for that much longer, so the horizon a single touch opens is
+# assertion_lifetime_s + lifetime_s — the assertion stays exchangeable for the
+# first, and the last access token it buys lives for the second after that. The
+# ceiling is tightened to this alias's own lifetime_s so the assertion never
+# outlives the credential it exists to buy, and a non-default value is named on
+# the touch prompt.
 #
 # Requests that arrive while an identical one is already being signed are
 # always answered from that signature, at every setting. They were queued
@@ -46,6 +57,7 @@ jwk_kid = "replace-with-43-char-base64url-spki-digest1"
 cloud = "gcp" # optional; gcp is the only supported value
 target = "readonly-sa@example-project-id.iam.gserviceaccount.com"
 lifetime_s = 3600 # target access-token lifetime, 600..3600
+assertion_lifetime_s = 300 # assertion validity, 300..min(3600, lifetime_s)
 assertion_reuse_s = 0 # touch-free seconds after a touch, 0..210 (0 = every credential is touched)
 
 [aliases.deploy]

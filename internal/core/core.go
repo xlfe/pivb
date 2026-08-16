@@ -355,9 +355,10 @@ func (c *Core) Lock() {
 }
 
 // SubjectToken validates the request against configuration, opens one PIV
-// signing session, and returns a five-minute RS256 OIDC subject token bound
-// to the enrolled key observed in that session. The token is returned to the
-// caller and never retained or logged by the daemon.
+// signing session, and returns an RS256 OIDC subject token, valid for the
+// alias's configured assertion lifetime and bound to the enrolled key observed
+// in that session. The token is returned to the caller and never retained or
+// logged by the daemon.
 func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (SubjectTokenResult, error) {
 	if err := req.Attachment.Validate(); err != nil {
 		return SubjectTokenResult{}, err
@@ -414,6 +415,7 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	// what distinguishes a request that waited behind a signature from one
 	// that arrived after it.
 	aliasReuse := time.Duration(alias.AssertionReuseS) * time.Second
+	aliasLifetime := aliasAssertionLifetime(alias)
 	cacheKey := reuseKeyFor(req, alias)
 	arrival := c.now().UTC()
 	if c.arrivalHook != nil {
@@ -460,7 +462,7 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 			return nil, fmt.Errorf("live slot 9c public key on YubiKey %d does not match the claimed PIVB provider", serial)
 		}
 		var claimsErr error
-		claims, claimsErr = wif.NewClaims(provider, req.Alias, alias.Target, serial, kid, jti, now)
+		claims, claimsErr = wif.NewClaims(provider, req.Alias, alias.Target, serial, kid, jti, now, aliasLifetime)
 		if claimsErr != nil {
 			return nil, claimsErr
 		}
@@ -474,7 +476,7 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		return wif.SigningDigest(input), nil
 	}
 
-	label := signingLabel(req, alias.Target, aliasReuse)
+	label := signingLabel(req, alias.Target, aliasReuse, aliasLifetime)
 	signCtx := ctx
 	if req.ForwardContext.OperationID != "" {
 		signCtx = pivsigner.RequireLease(ctx)
@@ -538,10 +540,7 @@ func (c *Core) DescribeForwardProvider(ctx context.Context) (forwardapi.Descript
 	if kid != key.JWKKid {
 		return forwardapi.Description{}, fmt.Errorf("live slot 9c key on YubiKey %d derives jwk_kid %q but configuration expects %q", serial, kid, key.JWKKid)
 	}
-	aliases := make(map[string]forwardapi.AliasBinding, len(c.cfg.Aliases))
-	for name, alias := range c.cfg.Aliases {
-		aliases[name] = forwardapi.AliasBinding{Target: alias.Target}
-	}
+	aliases := c.aliasBindings()
 	provider := c.cfg.Provider()
 	return forwardapi.Description{
 		Version: forwardapi.ProtocolVersion, ProviderResource: provider.Resource(), IssuerURI: provider.IssuerURI,
@@ -553,10 +552,7 @@ func (c *Core) DescribeForwardProvider(ctx context.Context) (forwardapi.Descript
 // ForwardPolicy is the card-free half of provider discovery. An origin uses
 // it to reject a mismatched remote claim before publishing a workspace route.
 func (c *Core) ForwardPolicy() forwardapi.Policy {
-	aliases := make(map[string]forwardapi.AliasBinding, len(c.cfg.Aliases))
-	for name, alias := range c.cfg.Aliases {
-		aliases[name] = forwardapi.AliasBinding{Target: alias.Target}
-	}
+	aliases := c.aliasBindings()
 	keys := make([]forwardapi.EnrolledKey, 0, len(c.cfg.Keys))
 	for serial, key := range c.cfg.KeysBySerial() {
 		keys = append(keys, forwardapi.EnrolledKey{Serial: serial, KeyID: key.JWKKid})
@@ -567,6 +563,21 @@ func (c *Core) ForwardPolicy() forwardapi.Policy {
 		Version: forwardapi.ProtocolVersion, ProviderResource: provider.Resource(), IssuerURI: provider.IssuerURI,
 		Aliases: aliases, EnrolledKeys: keys,
 	}
+}
+
+// aliasBindings is what both halves of provider discovery advertise about each
+// alias. The assertion lifetime is always sent as its effective value, so an
+// origin comparing it against its own configuration sees the number the
+// provider will actually mint rather than an absent field it has to guess at.
+func (c *Core) aliasBindings() map[string]forwardapi.AliasBinding {
+	aliases := make(map[string]forwardapi.AliasBinding, len(c.cfg.Aliases))
+	for name, alias := range c.cfg.Aliases {
+		aliases[name] = forwardapi.AliasBinding{
+			Target:             alias.Target,
+			AssertionLifetimeS: int64(aliasAssertionLifetime(alias) / time.Second),
+		}
+	}
+	return aliases
 }
 
 // RouteSubjectToken mints and verifies one token through a ZKA route without
@@ -632,13 +643,28 @@ func RouteSubjectToken(ctx context.Context, cfg *config.Config, req SubjectToken
 		claims.Target != alias.Target || claims.Serial != strconv.FormatUint(uint64(response.Card.Serial), 10) || claims.Jti == "" {
 		return SubjectTokenResult{}, routeSecurityError("forwarded PIVB assertion claims do not match the requested local configuration")
 	}
+	// Assertion validity is per-alias configuration on both sides of the route,
+	// so a lifetime this origin does not configure is skew between two
+	// configurations rather than evidence of a hostile provider. It is reported
+	// as its own disagreement, in the same shape as the alias and target checks
+	// above, and the operator is told which key to align.
+	if want := int64(aliasAssertionLifetime(alias) / time.Second); claims.Exp-claims.Iat != want {
+		return SubjectTokenResult{}, routeAgreementError(fmt.Sprintf(
+			"forwarded PIVB assertion for alias %q is valid for %ds but this origin configures assertion_lifetime_s = %d",
+			req.Alias, claims.Exp-claims.Iat, want))
+	}
 	// Providers backdate iat by one ClockSkew. Allow one additional skew for
 	// an origin clock ahead of the provider and one skew in the other
-	// direction; exp is independently checked against the origin clock.
-	if claims.Exp-claims.Iat != int64(wif.Lifetime/time.Second) || response.ExpirationTime != claims.Exp ||
-		!claims.ExpiresAt().After(now().UTC()) || claims.Iat < started.Add(-2*wif.ClockSkew).Unix() ||
+	// direction; exp is independently checked against the origin clock. An
+	// origin that opted this alias into reuse also accepts an assertion that
+	// much more cache-aged, because the provider is entitled to answer from the
+	// signature that same window authorised. At assertion_reuse_s = 0 the bound
+	// is exactly the two-skew one.
+	originReuse := time.Duration(alias.AssertionReuseS) * time.Second
+	if response.ExpirationTime != claims.Exp || !claims.ExpiresAt().After(now().UTC()) ||
+		claims.Iat < started.Add(-2*wif.ClockSkew-originReuse).Unix() ||
 		claims.Iat > now().UTC().Add(wif.ClockSkew).Unix() {
-		return SubjectTokenResult{}, routeFreshnessError("forwarded PIVB assertion is stale or has an invalid lifetime")
+		return SubjectTokenResult{}, routeFreshnessError("forwarded PIVB assertion is stale or its expiry envelope disagrees")
 	}
 	if response.Card.KeyID != verified.HeaderKeyID {
 		return SubjectTokenResult{}, routeSecurityError("forwarded PIVB response card does not match the signed token")
@@ -657,6 +683,17 @@ func routeSecurityError(message string) error {
 	return &tokenapi.APIError{
 		Status: 502, Code: tokenapi.CodeConfig, Message: message, SecurityRelevant: true,
 		Remedy: "inspect the selected ZKA workspace route, provider identity, and enrolled card; release and re-claim the bundle only if the binding is wrong",
+	}
+}
+
+// routeAgreementError reports a value the two ends of a route configure
+// independently and disagree about. It is deliberately not security-relevant:
+// nothing about it says the provider is hostile, only that one of the two
+// configurations was changed without the other.
+func routeAgreementError(message string) error {
+	return &tokenapi.APIError{
+		Status: 502, Code: tokenapi.CodeConfig, Message: message,
+		Remedy: "align assertion_lifetime_s for this alias in the origin and provider pivb configurations, then retry",
 	}
 }
 
@@ -804,11 +841,22 @@ func (c *Core) loggerLocked() *slog.Logger {
 	return slog.Default()
 }
 
+// aliasAssertionLifetime is how long one assertion minted for this alias stays
+// exchangeable. config's defaulting pass fills the field in, so a zero reaches
+// here only from a hand-built configuration and reads as the default.
+func aliasAssertionLifetime(alias config.Alias) time.Duration {
+	if alias.AssertionLifetimeS <= 0 {
+		return wif.DefaultLifetime
+	}
+	return time.Duration(alias.AssertionLifetimeS) * time.Second
+}
+
 // signingLabel renders what the operator is asked to consent to. When the
 // alias configures a reuse window the prompt says so, because the touch is no
 // longer buying one credential: it is buying every byte-identical request for
-// the next reuse seconds.
-func signingLabel(req SubjectTokenRequest, target string, reuse time.Duration) string {
+// the next reuse seconds. A non-default assertion lifetime is named for the
+// same reason — it is the other half of how far this one touch reaches.
+func signingLabel(req SubjectTokenRequest, target string, reuse, lifetime time.Duration) string {
 	label := agentsource.SigningLabel(req.RequestSource, req.Alias, target)
 	if fc := req.ForwardContext; fc.OperationID != "" {
 		label = fmt.Sprintf("%s [ZKA origin=%s workspace=%s bundle=%s generation=%d operation=%s]",
@@ -816,6 +864,9 @@ func signingLabel(req SubjectTokenRequest, target string, reuse time.Duration) s
 	}
 	if reuse > 0 {
 		label += fmt.Sprintf("\nauthorises %s touch-free for %s", req.Alias, reuse)
+	}
+	if lifetime != wif.DefaultLifetime {
+		label += fmt.Sprintf("\nassertion valid %s", lifetime)
 	}
 	return label
 }

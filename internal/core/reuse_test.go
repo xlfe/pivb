@@ -923,7 +923,7 @@ func TestReuseNeverReachesTheRoutedBranch(t *testing.T) {
 	fixture := loadFixture(t, "a")
 	now := time.Unix(testNowUnix, 0).UTC()
 	card := forwardapi.CardIdentity{Serial: serialA, KeyID: kidA, SPKIDER: append([]byte(nil), fixture.cert.RawSubjectPublicKeyInfo...)}
-	claims, err := wif.NewClaims(testConfig("session").Provider(), "ro", roTarget, serialA, kidA, testJTI, now)
+	claims, err := wif.NewClaims(testConfig("session").Provider(), "ro", roTarget, serialA, kidA, testJTI, now, wif.DefaultLifetime)
 	if err != nil {
 		t.Fatal(err)
 	}
