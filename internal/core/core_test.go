@@ -21,6 +21,8 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,7 +130,13 @@ type signerCounts struct {
 // the live certificate of whichever card is currently inserted, offers it to
 // digestFor before any PIN is spent, applies the fleet swap rules, and only
 // then signs with that card's key.
+//
+// Its mutable state is guarded, because the coalescing tests drive it from many
+// goroutines at once. signGate holds a signature open the way a real touch
+// does, so a test can decide exactly which requests were queued behind it.
 type fakeSigner struct {
+	mu sync.Mutex
+
 	// current is the inserted card; verified is the card the cached PIN has
 	// already been checked against in an earlier session.
 	current  uint32
@@ -140,9 +148,59 @@ type fakeSigner struct {
 
 	labels []string
 	counts signerCounts
+
+	// signGate blocks inside Sign until a test closes it. readerNames is what
+	// ListReaderNames reports, and listErr fails the enumeration outright.
+	signGate    chan struct{}
+	readerNames []string
+	listErr     error
+}
+
+func (s *fakeSigner) snapshotCounts() signerCounts {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts
+}
+
+func (s *fakeSigner) snapshotLabels() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.labels...)
+}
+
+func (s *fakeSigner) setSignGate(gate chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signGate = gate
+}
+
+func (s *fakeSigner) setCurrent(serial uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = serial
+}
+
+func (s *fakeSigner) setReaders(names []string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readerNames, s.listErr = names, err
+}
+
+// ListReaderNames makes the fake a card-presence seam. A signer that does not
+// implement it disables the probe, so the default here — one reader, no error
+// — keeps every existing test on the probing path.
+func (s *fakeSigner) ListReaderNames() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return append([]string(nil), s.readerNames...), nil
 }
 
 func (s *fakeSigner) Describe(_ context.Context) (uint32, *x509.Certificate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	card, ok := s.cards[s.current]
 	if !ok {
 		return 0, nil, errors.New("no card")
@@ -151,6 +209,8 @@ func (s *fakeSigner) Describe(_ context.Context) (uint32, *x509.Certificate, err
 }
 
 func (s *fakeSigner) VerifyPIN(_ context.Context, pin string) (uint32, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.counts.verifies++
 	retries := s.retries[s.current]
 	if pin != s.pins[s.current] {
@@ -161,17 +221,27 @@ func (s *fakeSigner) VerifyPIN(_ context.Context, pin string) (uint32, int, erro
 }
 
 func (s *fakeSigner) Sign(_ context.Context, label, pin string, digestFor func(uint32, *x509.Certificate) ([]byte, error)) ([]byte, uint32, error) {
+	s.mu.Lock()
 	serial := s.current
 	s.labels = append(s.labels, label)
 	card, present := s.cards[serial]
+	gate := s.signGate
+	s.mu.Unlock()
 	if !present {
 		return nil, 0, fmt.Errorf("read certificate from PIV slot 9c on YubiKey %d: no card registered in the fake", serial)
+	}
+	// A real touch takes seconds. Waiting here is what lets the requests that
+	// will share this signature queue up behind it.
+	if gate != nil {
+		<-gate
 	}
 
 	// Hardware builds the digest before spending any PIN attempt, and reports
 	// no serial when that fails: a nonzero serial is the signal that the cached
 	// PIN was verified against the card during this operation.
+	s.mu.Lock()
 	s.counts.digestRequests++
+	s.mu.Unlock()
 	digest, err := digestFor(serial, card.cert)
 	if err != nil {
 		return nil, 0, fmt.Errorf("build signing digest for YubiKey %d: %w", serial, err)
@@ -182,9 +252,11 @@ func (s *fakeSigner) Sign(_ context.Context, label, pin string, digestFor func(u
 	// against the card. Core discards the serial for any *PINError, so the two
 	// behave alike, but an assertion that depends on the difference is only
 	// testing this fake.
+	s.mu.Lock()
 	if serial != s.verified {
 		retries := s.retries[serial]
 		if retries <= 1 {
+			s.mu.Unlock()
 			return nil, serial, &pivsigner.PINError{
 				Retries: retries,
 				Err:     fmt.Errorf("refusing to try the cached PIN on swapped YubiKey %d and spend the final PIN attempt", serial),
@@ -194,6 +266,7 @@ func (s *fakeSigner) Sign(_ context.Context, label, pin string, digestFor func(u
 		s.counts.swapVerifies++
 		if pin != s.pins[serial] {
 			s.verified = 0
+			s.mu.Unlock()
 			return nil, serial, &pivsigner.PINError{
 				Retries:        retries - 1,
 				Err:            fmt.Errorf("cached PIN was rejected by swapped YubiKey %d; fleet keys may have different PINs", serial),
@@ -203,12 +276,15 @@ func (s *fakeSigner) Sign(_ context.Context, label, pin string, digestFor func(u
 		}
 		s.verified = serial
 	}
+	s.mu.Unlock()
 
 	sig, err := rsa.SignPKCS1v15(rand.Reader, card.key, crypto.SHA256, digest)
 	if err != nil {
 		return nil, serial, fmt.Errorf("sign with PIV slot 9c on YubiKey %d: %w", serial, err)
 	}
+	s.mu.Lock()
 	s.counts.signatures++
+	s.mu.Unlock()
 	return sig, serial, nil
 }
 
@@ -238,21 +314,117 @@ func testConfig(mode string) *config.Config {
 func newTestCore(t *testing.T, cfg *config.Config, inserted uint32) (*Core, *fakeSigner) {
 	t.Helper()
 	signer := &fakeSigner{
-		current: inserted,
-		cards:   map[uint32]fixtureKey{serialA: loadFixture(t, "a"), serialB: loadFixture(t, "b")},
-		pins:    map[uint32]string{serialA: pinA, serialB: pinA},
-		retries: map[uint32]int{serialA: 3, serialB: 3},
+		current:     inserted,
+		cards:       map[uint32]fixtureKey{serialA: loadFixture(t, "a"), serialB: loadFixture(t, "b")},
+		pins:        map[uint32]string{serialA: pinA, serialB: pinA},
+		retries:     map[uint32]int{serialA: 3, serialB: 3},
+		readerNames: []string{"Yubico YubiKey OTP+FIDO+CCID 00 00"},
 	}
 	return New(cfg, signer, testVersion), signer
 }
 
 // fixClock pins the signing instant and the jti stream so a minted token is
-// byte-for-byte predictable.
+// byte-for-byte predictable. A frozen clock makes sequential mints
+// indistinguishable from concurrent ones, so a test that mints the same
+// request twice wants tickClock instead.
 func fixClock(c *Core) time.Time {
 	now := time.Unix(testNowUnix, 0).UTC()
 	c.SetNowForTest(func() time.Time { return now })
 	c.SetRandomForTest(strings.NewReader(strings.Repeat(testJTISeed, 8)))
 	return now
+}
+
+// tickClock is the honest counterpart to fixClock: waiting for a touch takes
+// real time, so every read of the clock advances it. Requests minted under it
+// are strictly sequential, which is what a default-configuration daemon must
+// never coalesce. It is safe to read from many goroutines at once.
+type tickClock struct {
+	mu      sync.Mutex
+	instant time.Time
+}
+
+func startTickClock(c *Core) *tickClock {
+	clock := &tickClock{instant: time.Unix(testNowUnix, 0).UTC()}
+	c.SetNowForTest(clock.now)
+	c.SetRandomForTest(rand.Reader)
+	return clock
+}
+
+func (t *tickClock) now() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.instant = t.instant.Add(time.Second)
+	return t.instant
+}
+
+// advance jumps the clock, so a test can sit inside or past a reuse window
+// without spending thousands of reads to get there.
+func (t *tickClock) advance(d time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.instant = t.instant.Add(d)
+}
+
+// mintRace runs n identical requests concurrently and holds the signature open
+// until every one of them has recorded its arrival, so the whole group is
+// provably queued behind one touch rather than merely likely to be.
+func mintRace(t *testing.T, c *Core, signer *fakeSigner, req SubjectTokenRequest, n int) []SubjectTokenResult {
+	t.Helper()
+	gate := make(chan struct{})
+	signer.setSignGate(gate)
+	defer signer.setSignGate(nil)
+
+	var pending atomic.Int32
+	pending.Store(int32(n))
+	c.SetMintArrivalHookForTest(func() {
+		if pending.Add(-1) == 0 {
+			close(gate)
+		}
+	})
+	defer c.SetMintArrivalHookForTest(nil)
+
+	results := make([]SubjectTokenResult, n)
+	errs := make([]error, n)
+	var running sync.WaitGroup
+	running.Add(n)
+	for i := range n {
+		go func() {
+			defer running.Done()
+			results[i], errs[i] = c.SubjectToken(context.Background(), req)
+		}()
+	}
+	running.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent SubjectToken %d: %v", i, err)
+		}
+	}
+	return results
+}
+
+// reuseConfig is testConfig with a touch-free window on every alias.
+func reuseConfig(mode string, reuse int) *config.Config {
+	cfg := testConfig(mode)
+	for name, alias := range cfg.Aliases {
+		alias.AssertionReuseS = reuse
+		cfg.Aliases[name] = alias
+	}
+	return cfg
+}
+
+// onlyEntry returns the single cached assertion, failing when the cache does
+// not hold exactly one.
+func onlyEntry(t *testing.T, c *Core) (reuseKey, *cacheEntry) {
+	t.Helper()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.cache) != 1 {
+		t.Fatalf("cache holds %d assertions, want exactly 1", len(c.cache))
+	}
+	for key, entry := range c.cache {
+		return key, entry
+	}
+	return reuseKey{}, nil
 }
 
 func roRequest() SubjectTokenRequest {
@@ -652,7 +824,11 @@ func TestForwardDescriptionAndExpectedCardAreBoundToLiveSession(t *testing.T) {
 
 func TestNeverModeSpendsTheCachedPINOnOneToken(t *testing.T) {
 	c, signer := newTestCore(t, testConfig("never"), serialA)
+	// The two requests below are sequential, not concurrent, so the clock has
+	// to move between them: a frozen clock would make the second look like a
+	// request that had been queued behind the first one's touch.
 	fixClock(c)
+	startTickClock(c)
 	unlockOK(t, c, pinA)
 
 	result := mintOK(t, c, roRequest())
@@ -956,15 +1132,18 @@ func TestMintRateWarnFiresOncePerWindow(t *testing.T) {
 }
 
 func TestJTIIsUniquePerToken(t *testing.T) {
-	c, _ := newTestCore(t, testConfig("session"), serialA)
-	// The clock is fixed but the jti stream is not: identical claim sets must
-	// still produce distinct token identifiers.
-	now := time.Unix(testNowUnix, 0).UTC()
-	c.SetNowForTest(func() time.Time { return now })
+	c, signer := newTestCore(t, testConfig("session"), serialA)
+	// Two byte-identical requests, one after the other, on a default
+	// configuration: neither is queued behind the other's touch, so each buys
+	// its own signature and its own token identifier.
+	startTickClock(c)
 	unlockOK(t, c, pinA)
 
 	first := parseToken(t, mintOK(t, c, roRequest()).IDToken)
 	second := parseToken(t, mintOK(t, c, roRequest()).IDToken)
+	if got := signer.snapshotCounts().signatures; got != 2 {
+		t.Fatalf("two sequential identical requests spent %d signatures, want 2", got)
+	}
 
 	firstJTI, _ := first.claims["jti"].(string)
 	secondJTI, _ := second.claims["jti"].(string)

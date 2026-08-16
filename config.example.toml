@@ -27,10 +27,26 @@ jwk_kid = "replace-with-43-char-base64url-spki-digest1"
 
 # One alias per target service account. Each alias gets its own credential
 # file, provider-condition pair, and per-target Workload Identity User binding.
+#
+# assertion_reuse_s is consent, not a cache setting. At 0, the default, every
+# credential this alias issues costs one physical touch. Above 0, one touch
+# authorises this alias touch-free for up to that many further seconds — but
+# only for the byte-identical requester tuple: same alias, target, audience,
+# agent session, attachment policy, claimed card, and workspace claim
+# generation. Anything else still asks for a touch, the touch prompt states
+# what it is granting, and the window is announced 60 seconds before it closes.
+# The bound is 210 seconds: an assertion lives 300 seconds, 30 of which are
+# already spent on iat backdating when it is signed, and a served assertion
+# must keep at least 60 seconds of validity.
+#
+# Requests that arrive while an identical one is already being signed are
+# always answered from that signature, at every setting. They were queued
+# behind that touch, so they are part of what it authorised.
 [aliases.ro]
 cloud = "gcp" # optional; gcp is the only supported value
 target = "readonly-sa@example-project-id.iam.gserviceaccount.com"
 lifetime_s = 3600 # target access-token lifetime, 600..3600
+assertion_reuse_s = 0 # touch-free seconds after a touch, 0..210 (0 = every credential is touched)
 
 [aliases.deploy]
 target = "deployment-sa@example-project-id.iam.gserviceaccount.com"

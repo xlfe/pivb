@@ -394,21 +394,46 @@ func (h *Hardware) notify(message string) {
 		h.notifyFunc(message)
 		return
 	}
-	if len(h.Notify) == 0 {
-		return
-	}
-	args := append(append([]string(nil), h.Notify[1:]...), message)
-	cmd := exec.Command(h.Notify[0], args...)
-	if err := cmd.Start(); err != nil {
-		h.logger().Warn("desktop notification failed", "error", err)
-		return
-	}
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			h.logger().Warn("desktop notification failed", "error", err)
-		}
-	}()
+	NotifyCommand(h.Notify, h.Logger)(message)
 }
+
+// NotifyCommand builds the operator notifier from a configured notify_cmd: the
+// message is appended to argv and the command is started detached, so a slow
+// or missing notifier can never delay or fail the operation that raised it. An
+// empty argv disables notifications. The daemon's reuse-window notices use the
+// same notifier as the touch prompt, so they reach the operator the same way.
+func NotifyCommand(argv []string, logger *slog.Logger) func(string) {
+	if len(argv) == 0 {
+		return func(string) {}
+	}
+	name := argv[0]
+	base := append([]string(nil), argv[1:]...)
+	warn := func(err error) {
+		log := logger
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("desktop notification failed", "error", err)
+	}
+	return func(message string) {
+		cmd := exec.Command(name, append(append([]string(nil), base...), message)...)
+		if err := cmd.Start(); err != nil {
+			warn(err)
+			return
+		}
+		go func() {
+			if err := cmd.Wait(); err != nil {
+				warn(err)
+			}
+		}()
+	}
+}
+
+// ListReaderNames reports the smart-card readers PC/SC currently sees. It
+// opens no card, verifies no PIN, and requests no touch: core uses it to
+// notice that the card an operator touched has left the reader before it
+// serves that touch's assertion again.
+func (h *Hardware) ListReaderNames() ([]string, error) { return h.readers() }
 
 func (h *Hardware) logger() *slog.Logger {
 	if h.Logger != nil {

@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -56,5 +60,64 @@ func TestWorkspaceLeaseFailsClosedWhileDirectLocalMayContinue(t *testing.T) {
 	hardware.Lease = fakeLeaseManager{err: errors.New("lease denied")}
 	if _, err := hardware.acquireLease(context.Background(), "pivb-mint", time.Second); err == nil {
 		t.Fatal("direct-local operation bypassed an explicit lease error")
+	}
+}
+
+// TestListReaderNamesUsesTheReaderSeam keeps the card-presence probe on the
+// same enumeration the card selector uses, so what core compares is what the
+// signer would actually open.
+func TestListReaderNamesUsesTheReaderSeam(t *testing.T) {
+	want := []string{"Yubico YubiKey OTP+FIDO+CCID 00 00", "gpg"}
+	hardware := &Hardware{listReaders: func() ([]string, error) { return want, nil }}
+	got, err := hardware.ListReaderNames()
+	if err != nil {
+		t.Fatalf("ListReaderNames: %v", err)
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("ListReaderNames() = %q, want %q", got, want)
+	}
+
+	failing := &Hardware{listReaders: func() ([]string, error) { return nil, errors.New("pcscd is unavailable") }}
+	if _, err := failing.ListReaderNames(); err == nil {
+		t.Error("a failed enumeration was reported as an empty reader list")
+	}
+}
+
+// TestNotifyCommandRunsTheConfiguredCommand pins the notifier both halves of
+// the daemon share: the message is the final argument, an empty argv disables
+// notifications, and a command that cannot start never fails its caller.
+func TestNotifyCommandRunsTheConfiguredCommand(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "notified")
+	NotifyCommand([]string{"sh", "-c", `printf '%s' "$1" > ` + marker, "sh"}, nil)("touch YubiKey")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		body, err := os.ReadFile(marker)
+		if err == nil {
+			if string(body) != "touch YubiKey" {
+				t.Fatalf("notifier delivered %q", body)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("notifier wrote nothing: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	NotifyCommand(nil, nil)("dropped")
+	NotifyCommand([]string{"/nonexistent/pivb-notifier"}, slog.New(slog.NewTextHandler(io.Discard, nil)))("dropped")
+}
+
+// TestHardwareNotifyPrefersTheInjectedSeam keeps the test seam ahead of the
+// configured command.
+func TestHardwareNotifyPrefersTheInjectedSeam(t *testing.T) {
+	var seen []string
+	hardware := &Hardware{
+		Notify:     []string{"/nonexistent/pivb-notifier"},
+		notifyFunc: func(message string) { seen = append(seen, message) },
+	}
+	hardware.notify("Touch YubiKey to sign ro")
+	if len(seen) != 1 || seen[0] != "Touch YubiKey to sign ro" {
+		t.Fatalf("injected notifier saw %q", seen)
 	}
 }

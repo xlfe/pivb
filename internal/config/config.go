@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -25,6 +26,10 @@ const (
 	defaultLifetimeS = 3600
 	minLifetimeS     = 600
 	maxLifetimeS     = 3600
+	// minRemainingValidityS is the validity a reused assertion must still have
+	// left when it is served, so it can complete a full STS exchange. It is the
+	// same floor internal/core enforces at serve time (reuseValidityFloor).
+	minRemainingValidityS = 60
 )
 
 // migrationDoc is named by the single migration error for retired keys.
@@ -77,6 +82,24 @@ type Alias struct {
 	Cloud     string `toml:"cloud"`
 	Target    string `toml:"target"`
 	LifetimeS int    `toml:"lifetime_s"`
+	// AssertionReuseS is how long after a touch this alias may answer
+	// byte-identical requests without another one. Zero, the default, means
+	// every credential costs a touch.
+	AssertionReuseS int `toml:"assertion_reuse_s"`
+}
+
+// aliasAssertionLifetimeS is the validity of one minted assertion in seconds.
+// Every alias shares wif.Lifetime today; a later change makes it per-alias,
+// which is why the reuse bound is already expressed as a function of the alias
+// rather than of a package constant.
+func aliasAssertionLifetimeS(Alias) int { return int(wif.Lifetime / time.Second) }
+
+// maxAssertionReuseS is the largest reuse window an alias may configure. The
+// headroom keeps every served assertion at least minRemainingValidityS from
+// expiry: wif backdates iat by one ClockSkew at mint time, so that much of the
+// lifetime is already spent when the assertion is signed.
+func maxAssertionReuseS(alias Alias) int {
+	return aliasAssertionLifetimeS(alias) - int(wif.ClockSkew/time.Second) - minRemainingValidityS
 }
 
 func DefaultPath() (string, error) {
@@ -241,6 +264,11 @@ func (c *Config) Validate() error {
 		}
 		if alias.LifetimeS < minLifetimeS || alias.LifetimeS > maxLifetimeS {
 			fail("config key %q must be between %d and %d seconds", prefix+".lifetime_s", minLifetimeS, maxLifetimeS)
+		}
+		if maximum := maxAssertionReuseS(alias); alias.AssertionReuseS < 0 || alias.AssertionReuseS > maximum {
+			fail("config key %q must be between 0 and %d seconds (%ds assertion lifetime − %ds iat backdating − %ds minimum remaining validity), got %d",
+				prefix+".assertion_reuse_s", maximum, aliasAssertionLifetimeS(alias),
+				int(wif.ClockSkew/time.Second), minRemainingValidityS, alias.AssertionReuseS)
 		}
 	}
 	return errors.Join(errs...)

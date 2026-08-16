@@ -112,7 +112,8 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 	attrs := []any{"alias", req.Alias, "target", req.ImpersonatedEmail,
 		"source_kind", source.Kind, "attachment_mode", attachmentContext.Mode,
 		"attachment_protocol", attachmentContext.Protocol, "route_kind", routeKind(attachmentContext),
-		"serial", result.Serial, "key_id", result.KeyID, "expires_at", result.ExpiresAt}
+		"serial", result.Serial, "key_id", result.KeyID, "expires_at", result.ExpiresAt,
+		"reused", result.Reused}
 	if source.Kind == agentsource.KindAgentSession {
 		attrs = append(attrs, "source_label", source.Label, "session_id", source.SessionID)
 	}

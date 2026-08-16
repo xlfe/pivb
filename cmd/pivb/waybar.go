@@ -153,6 +153,11 @@ func formatWaybarStatus(status core.Status, statusErr error, now time.Time) wayb
 	if status.Mints != nil {
 		lines = append(lines, fmt.Sprintf("Mints: %d/1m %d/5m %d/60m", status.Mints.Total1m, status.Mints.Total5m, status.Mints.Total60m))
 	}
+	// The window that closes first is the one the operator needs to know about:
+	// it is the next mint that will ask for a touch.
+	if nearest, left, ok := nearestReuseWindow(status.ReuseWindows, now); ok {
+		lines = append(lines, "Window: "+nearest.Alias+" "+windowLeftText(left)+" left")
+	}
 	if status.WIFProvider != "" {
 		lines = append(lines, "Provider: "+status.WIFProvider)
 	}
@@ -166,6 +171,33 @@ func formatWaybarStatus(status core.Status, statusErr error, now time.Time) wayb
 		Class:   state,
 		Alt:     state,
 	}
+}
+
+// nearestReuseWindow picks the touch-free window that closes soonest and how
+// long it has left. A window already past its end is reported as absent.
+func nearestReuseWindow(windows []core.ReuseWindow, now time.Time) (core.ReuseWindow, time.Duration, bool) {
+	var nearest core.ReuseWindow
+	found := false
+	for _, window := range windows {
+		if !window.WindowEndsAt.After(now) {
+			continue
+		}
+		if !found || window.WindowEndsAt.Before(nearest.WindowEndsAt) {
+			nearest, found = window, true
+		}
+	}
+	if !found {
+		return core.ReuseWindow{}, 0, false
+	}
+	return nearest, nearest.WindowEndsAt.Sub(now), true
+}
+
+func windowLeftText(d time.Duration) string {
+	seconds := int(d.Round(time.Second) / time.Second)
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	return fmt.Sprintf("%dm%02ds", seconds/60, seconds%60)
 }
 
 func agoText(d time.Duration) string {

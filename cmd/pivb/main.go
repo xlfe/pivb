@@ -156,6 +156,7 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 	}
 	daemonCore := core.New(cfg, signer, version.Value)
 	daemonCore.SetLogger(logger)
+	daemonCore.SetNotify(pivsigner.NotifyCommand(cfg.NotifyCmd, logger))
 	control := &agentapi.API{Core: daemonCore, Logger: logger}
 	signing := &wifapi.API{Core: daemonCore, Logger: logger}
 	forwarding := &forwardapi.API{Backend: forwardBackend{core: daemonCore, logger: logger}}
@@ -170,6 +171,9 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 		serverCount++
 	}
 	errCh := make(chan error, serverCount)
+	// The notifier retires reuse-cache entries and warns before a touch-free
+	// window closes. It holds no card and exits with ctx.
+	go daemonCore.RunNotifier(ctx)
 	go func() { errCh <- uds.Serve(ctx, controlSocket, control.Handler(), uds.WithLogger(logger)) }()
 	go func() { errCh <- uds.Serve(ctx, wifSocket, signing.Handler(), uds.WithLogger(logger)) }()
 	if forwardSocket != "" {

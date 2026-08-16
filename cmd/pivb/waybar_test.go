@@ -81,6 +81,15 @@ func TestFormatWaybarStatus(t *testing.T) {
 		Total1m: 2, Total5m: 7, Total60m: 41, Signatures60m: 41,
 		PerAlias60m: map[string]int{"ro": 41},
 	}
+	windowed := signed
+	windowed.ReuseWindows = []core.ReuseWindow{
+		{Alias: "gcp-au-dev-ro", Serial: testSerialA, WindowEndsAt: now.Add(130 * time.Second), TokenExpiresAt: now.Add(200 * time.Second)},
+		{Alias: "deploy", Serial: testSerialA, WindowEndsAt: now.Add(200 * time.Second), TokenExpiresAt: now.Add(260 * time.Second)},
+	}
+	closed := signed
+	closed.ReuseWindows = []core.ReuseWindow{
+		{Alias: "ro", Serial: testSerialA, WindowEndsAt: now.Add(-time.Second), TokenExpiresAt: now.Add(60 * time.Second)},
+	}
 
 	tests := []struct {
 		name        string
@@ -131,6 +140,22 @@ func TestFormatWaybarStatus(t *testing.T) {
 				"Last mint: ro → " + testTargetRO,
 				"Mints: 2/1m 7/5m 41/60m",
 			},
+		},
+		{
+			name:      "ready inside a touch-free window",
+			status:    windowed,
+			wantClass: "ready",
+			// The window that closes first is the next mint that will ask for
+			// a touch, so it is the one the tooltip names.
+			wantTooltip: []string{"Window: gcp-au-dev-ro 2m10s left"},
+			notTooltip:  []string{"deploy"},
+		},
+		{
+			name:        "ready after every window closed",
+			status:      closed,
+			wantClass:   "ready",
+			wantTooltip: []string{"Last mint: ro → " + testTargetRO},
+			notTooltip:  []string{"Window:"},
 		},
 		{
 			name:      "locked origin after a forwarded mint",

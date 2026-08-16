@@ -437,7 +437,45 @@ func TestLoadRejectsInvalidAliases(t *testing.T) {
 		{"shared target", sharedTarget, []string{"dedicated target service account", baseTarget}},
 		{"lifetime 599", setValue(t, baseConfig(), "lifetime_s", "599"), []string{`"aliases.ro.lifetime_s"`}},
 		{"lifetime 3601", setValue(t, baseConfig(), "lifetime_s", "3601"), []string{`"aliases.ro.lifetime_s"`}},
+		{
+			"assertion reuse one second past the bound",
+			withAliasLine("assertion_reuse_s = 211"),
+			// The message has to show the operator where 210 comes from, not
+			// just assert it.
+			[]string{`"aliases.ro.assertion_reuse_s"`, "between 0 and 210 seconds",
+				"300s assertion lifetime", "30s iat backdating", "60s minimum remaining validity", "got 211"},
+		},
+		{
+			"assertion reuse negative",
+			withAliasLine("assertion_reuse_s = -1"),
+			[]string{`"aliases.ro.assertion_reuse_s"`, "got -1"},
+		},
 	})
+}
+
+// TestAssertionReuseBounds pins both edges of the consent window an alias may
+// buy with one touch, and the default that buys none.
+func TestAssertionReuseBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		toml string
+		want int
+	}{
+		{"absent", baseConfig(), 0},
+		{"zero", withAliasLine("assertion_reuse_s = 0"), 0},
+		{"one second", withAliasLine("assertion_reuse_s = 1"), 1},
+		{"the whole bound", withAliasLine("assertion_reuse_s = 210"), 210},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadFrom(t, tc.toml)
+			if err != nil {
+				t.Fatalf("Load rejected a valid reuse window: %v", err)
+			}
+			if got := cfg.Aliases["ro"].AssertionReuseS; got != tc.want {
+				t.Errorf("assertion_reuse_s = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestLoadAcceptsGrammarBoundaries pins the accepting edge of each grammar so

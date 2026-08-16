@@ -77,6 +77,10 @@ type SubjectTokenResult struct {
 	KeyID          string
 	SPKIDER        []byte
 	ForwardContext forwardapi.ForwardContext
+	// Reused reports an assertion served from an already-authorised signature
+	// rather than from a fresh touch. It is observability only: the token is
+	// byte-identical to the one that touch produced.
+	Reused bool
 }
 
 // SignEvent records the metadata of the last successful signature for
@@ -112,10 +116,98 @@ const (
 	mintRingCap    = 4096
 	// A session that crosses mintWarnThreshold mints within mintWarnWindow
 	// earns one journal warning per window. This is visibility, not policy:
-	// every one of those mints still required a physical touch.
+	// none of those mints was refused, and the ones served from the reuse
+	// cache spent no touch at all.
 	mintWarnThreshold = 30
 	mintWarnWindow    = 5 * time.Minute
 )
+
+const (
+	// defaultSingleFlight coalesces the requests that arrive while a
+	// byte-identical request is already being signed. One touch authorises one
+	// request tuple; handing that tuple's queued duplicates the same signature
+	// spends no further touch and grants no authority the touch did not. It is
+	// one flippable constant so the behaviour can be disabled fleet-wide.
+	defaultSingleFlight = true
+	// reuseValidityFloor is the remaining assertion validity below which a
+	// cached assertion is never served, so every reused token still has a full
+	// minute in which to complete an STS exchange. internal/config bounds
+	// assertion_reuse_s against the same floor.
+	reuseValidityFloor = 60 * time.Second
+	// reuseCacheCap bounds the cache in entries; past it the entry with the
+	// oldest completion is evicted.
+	reuseCacheCap = 64
+	// reuseNotifyLead is how far ahead of a window's end the operator is told
+	// that touch-free reuse is about to stop.
+	reuseNotifyLead = 60 * time.Second
+	// readerPollInterval is how often the notifier re-enumerates smart-card
+	// readers while the cache is non-empty, so removing the card drops the
+	// reuse state without waiting for the next mint.
+	readerPollInterval = 2 * time.Second
+	// invalidatedCap bounds the per-workspace invalidation watermarks.
+	invalidatedCap = 256
+)
+
+// reuseKey is the requester tuple a touch authorises. Two requests share a
+// signature only if every field matches, so the operator's consent covers
+// exactly what they were shown on the touch prompt. It is deliberately
+// comparable: it is a map key, never a fingerprint to be logged.
+//
+// ForwardContext.OperationID and ProviderAttachID are excluded on purpose:
+// they identify one request, not one requester, and every forwarded mint
+// carries a fresh pair. Everything an operator could read off the prompt —
+// alias, target, audience, session, attachment, claimed card, workspace claim
+// and its generation — is inside the key.
+type reuseKey struct {
+	alias, target, audience            string
+	sourceKind, sourceLabel, sessionID string
+	attachmentMode                     string
+	attachmentProtocol                 int
+	routeSocket                        string
+	cardSerial                         uint32
+	cardKID                            string
+	cardSPKI                           string
+	originNodeID, workspaceID, bundle  string
+	claimGeneration                    uint64
+}
+
+// cacheEntry is one already-authorised assertion. token is the only secret in
+// it and is zeroized on every path that drops the entry.
+type cacheEntry struct {
+	key         reuseKey
+	token       []byte
+	completedAt time.Time
+	expiresAt   time.Time
+	serial      uint32
+	keyID       string
+	spki        []byte
+	// readers is the sorted reader-name snapshot taken when the assertion was
+	// signed. nil means the signer cannot enumerate readers at all, which
+	// disables the presence probe rather than failing it.
+	readers []string
+	// windowEndsAt is completedAt plus the alias reuse duration. It equals
+	// completedAt when the entry exists only to coalesce concurrent requests,
+	// which is how the notifier tells a consent window from a queue.
+	windowEndsAt    time.Time
+	notifiedPre     bool
+	notifiedExpired bool
+}
+
+// ReuseWindow is one operator-visible touch-free window. It carries no token
+// material and no request identifiers.
+type ReuseWindow struct {
+	Alias          string    `json:"alias"`
+	SessionID      string    `json:"session_id,omitempty"`
+	Serial         uint32    `json:"serial"`
+	WindowEndsAt   time.Time `json:"window_ends_at"`
+	TokenExpiresAt time.Time `json:"token_expires_at"`
+}
+
+// readerLister is the optional card-presence seam. pivsigner.Hardware
+// implements it; fakes that do not simply skip the probe.
+type readerLister interface {
+	ListReaderNames() ([]string, error)
+}
 
 // MintCounters is the rolling in-memory mint rate. Reporting it touches no
 // card and reveals no token material.
@@ -124,7 +216,7 @@ type MintCounters struct {
 	Total5m  int `json:"total_5m"`
 	Total60m int `json:"total_60m"`
 	// Signatures60m counts the mints that spent a touch rather than reusing an
-	// assertion. It equals Total60m until a reuse cache exists.
+	// assertion an earlier touch already authorised.
 	Signatures60m int            `json:"signatures_60m"`
 	PerAlias60m   map[string]int `json:"per_alias_60m,omitempty"`
 	PerSession60m map[string]int `json:"per_session_60m,omitempty"`
@@ -142,6 +234,7 @@ type Status struct {
 	LastSignRoute     string                     `json:"last_sign_route,omitempty"`
 	LastSignForward   *forwardapi.ForwardContext `json:"last_sign_forward_context,omitempty"`
 	Mints             *MintCounters              `json:"mints,omitempty"`
+	ReuseWindows      []ReuseWindow              `json:"reuse_windows,omitempty"`
 	Version           string                     `json:"version"`
 }
 
@@ -163,18 +256,62 @@ type Core struct {
 	// warnedAt records when each session last triggered a rate warning.
 	mintRing []mintRecord
 	warnedAt map[string]time.Time
+
+	// cache holds already-authorised assertions; singleFlight decides whether
+	// an entry may serve requests that were queued behind its own signature.
+	cache        map[reuseKey]*cacheEntry
+	singleFlight bool
+	// invalidated is workspaceID → the highest claim generation whose cached
+	// assertions have been invalidated. It exists to close one race: a mint
+	// that entered the card before a purge must not insert its result after
+	// it, and mintMu is deliberately not held by the purge.
+	invalidated map[string]uint64
+	// pendingWorkspace and pendingGeneration describe the single local mint
+	// currently inside signer.Sign. mintMu serializes the local branch, so
+	// there is never more than one, and a release-everything invalidation uses
+	// it to raise its watermark over a claim that is not in the cache yet.
+	pendingWorkspace  string
+	pendingGeneration uint64
+
+	notifyFn   func(string)
+	notifyWake chan struct{}
+	// arrivalHook runs immediately after a local request records its arrival
+	// instant. Production leaves it nil; concurrency tests use it to hold every
+	// racing request at the same point in the mint path.
+	arrivalHook func()
 }
 
 func New(cfg *config.Config, signer pivsigner.Signer, version string) *Core {
 	return &Core{
 		cfg: cfg, signer: signer, version: version,
-		now:    time.Now,
-		random: rand.Reader,
+		now:          time.Now,
+		random:       rand.Reader,
+		singleFlight: defaultSingleFlight,
+		notifyWake:   make(chan struct{}, 1),
 	}
 }
 
 func (c *Core) SetNowForTest(now func() time.Time) { c.now = now }
 func (c *Core) SetRandomForTest(random io.Reader)  { c.random = random }
+
+// SetSingleFlightForTest disables or restores concurrency coalescing. A daemon
+// built by New always starts at defaultSingleFlight.
+func (c *Core) SetSingleFlightForTest(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.singleFlight = enabled
+}
+
+func (c *Core) SetMintArrivalHookForTest(hook func()) { c.arrivalHook = hook }
+
+// SetNotify routes reuse-window notices to the operator's desktop. Without it
+// the notices are computed and the entries still expire; only the message is
+// dropped.
+func (c *Core) SetNotify(notify func(string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.notifyFn = notify
+}
 
 // SetLogger routes core's own observations — today, only the mint-rate
 // warning — to l. Without it they go to slog.Default().
@@ -198,11 +335,15 @@ func (c *Core) Unlock(ctx context.Context, pin string) (int, error) {
 	c.clearPINLocked()
 	c.pin = append([]byte(nil), pin...)
 	c.pinVerifiedSerial = serial
+	// The card that is now authenticated is the only one whose touches this
+	// daemon may still be trading on.
+	c.purgeOtherSerialsLocked(serial)
 	c.mu.Unlock()
 	return retries, nil
 }
 
-// Lock discards the cached PIN and the cached signing metadata.
+// Lock discards the cached PIN, the cached signing metadata, and every
+// already-authorised assertion.
 func (c *Core) Lock() {
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
@@ -210,6 +351,7 @@ func (c *Core) Lock() {
 	defer c.mu.Unlock()
 	c.clearPINLocked()
 	c.lastSign = nil
+	c.purgeAllLocked()
 }
 
 // SubjectToken validates the request against configuration, opens one PIV
@@ -267,8 +409,22 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		return SubjectTokenResult{}, &RequestMismatchError{Field: "impersonated_email", Got: req.ImpersonatedEmail, Want: alias.Target}
 	}
 	keys := c.cfg.KeysBySerial()
+	// The request is now fully bound to configuration, so it can be reduced to
+	// the tuple one touch authorises. arrival is taken before the queue: it is
+	// what distinguishes a request that waited behind a signature from one
+	// that arrived after it.
+	aliasReuse := time.Duration(alias.AssertionReuseS) * time.Second
+	cacheKey := reuseKeyFor(req, alias)
+	arrival := c.now().UTC()
+	if c.arrivalHook != nil {
+		c.arrivalHook()
+	}
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
+
+	if result, ok := c.serveAuthorised(cacheKey, req, arrival, aliasReuse); ok {
+		return result, nil
+	}
 	pin, err := c.takePIN()
 	if err != nil {
 		return SubjectTokenResult{}, err
@@ -318,11 +474,13 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		return wif.SigningDigest(input), nil
 	}
 
-	label := signingLabel(req, alias.Target)
+	label := signingLabel(req, alias.Target, aliasReuse)
 	signCtx := ctx
 	if req.ForwardContext.OperationID != "" {
 		signCtx = pivsigner.RequireLease(ctx)
 	}
+	c.beginPendingMint(cacheKey)
+	defer c.endPendingMint()
 	sig, serial, err := c.signer.Sign(signCtx, label, string(pin), digestFor)
 	c.recordPINVerification(serial, err)
 	if err != nil {
@@ -335,6 +493,10 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	if err != nil {
 		return SubjectTokenResult{}, err
 	}
+	// The touch took seconds, so the instant the assertion became authorised is
+	// this one, not the pre-sign now that dated its claims.
+	completedAt := c.now().UTC()
+	entry := c.newCacheEntry(cacheKey, token, claims.ExpiresAt(), completedAt, aliasReuse, serial, signedKid, signedSPKI)
 	c.mu.Lock()
 	route := "local"
 	if req.ForwardContext.OperationID != "" {
@@ -342,7 +504,11 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	}
 	c.lastSign = &SignEvent{Alias: req.Alias, Target: alias.Target, Serial: serial, KeyID: signedKid, At: now, Route: route, ForwardContext: req.ForwardContext}
 	c.recordMintLocked(mintRecord{at: now, alias: req.Alias, sessionID: req.RequestSource.SessionID})
+	inserted := c.insertLocked(entry)
 	c.mu.Unlock()
+	if inserted {
+		c.wakeNotifier()
+	}
 	return SubjectTokenResult{IDToken: token, ExpiresAt: claims.ExpiresAt(), Serial: serial, KeyID: signedKid, SPKIDER: signedSPKI}, nil
 }
 
@@ -535,6 +701,7 @@ func (c *Core) Status() Status {
 		}
 	}
 	status.Mints = c.mintCountersLocked()
+	status.ReuseWindows = c.reuseWindowsLocked()
 	return status
 }
 
@@ -637,14 +804,20 @@ func (c *Core) loggerLocked() *slog.Logger {
 	return slog.Default()
 }
 
-func signingLabel(req SubjectTokenRequest, target string) string {
+// signingLabel renders what the operator is asked to consent to. When the
+// alias configures a reuse window the prompt says so, because the touch is no
+// longer buying one credential: it is buying every byte-identical request for
+// the next reuse seconds.
+func signingLabel(req SubjectTokenRequest, target string, reuse time.Duration) string {
 	label := agentsource.SigningLabel(req.RequestSource, req.Alias, target)
-	fc := req.ForwardContext
-	if fc.OperationID == "" {
-		return label
+	if fc := req.ForwardContext; fc.OperationID != "" {
+		label = fmt.Sprintf("%s [ZKA origin=%s workspace=%s bundle=%s generation=%d operation=%s]",
+			label, fc.OriginNodeID, fc.WorkspaceID, fc.Bundle, fc.ClaimGeneration, fc.OperationID)
 	}
-	return fmt.Sprintf("%s [ZKA origin=%s workspace=%s bundle=%s generation=%d operation=%s]",
-		label, fc.OriginNodeID, fc.WorkspaceID, fc.Bundle, fc.ClaimGeneration, fc.OperationID)
+	if reuse > 0 {
+		label += fmt.Sprintf("\nauthorises %s touch-free for %s", req.Alias, reuse)
+	}
+	return label
 }
 
 func (c *Core) takePIN() ([]byte, error) {
@@ -676,11 +849,15 @@ func (c *Core) recordPINVerification(serial uint32, signErr error) {
 	if errors.As(signErr, &pinErr) {
 		if pinErr.ClearCachedPIN {
 			c.clearPINLocked()
+			// A PIN the card rejected leaves no basis for trading on anything
+			// that PIN authorised.
+			c.purgeAllLocked()
 		}
 		return
 	}
 	if serial != 0 && len(c.pin) != 0 {
 		c.pinVerifiedSerial = serial
+		c.purgeOtherSerialsLocked(serial)
 	}
 }
 
