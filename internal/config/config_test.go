@@ -312,7 +312,42 @@ func TestLoadRejectsInvalidGlobals(t *testing.T) {
 	runRejections(t, []loadCase{
 		{"piv_slot 9a", setString(t, baseConfig(), "piv_slot", "9a"), []string{`"piv_slot"`, "9a"}},
 		{"pin_cache always", setString(t, baseConfig(), "pin_cache", "always"), []string{`"pin_cache"`, "always"}},
+		{
+			"grant window past the ceiling",
+			withGlobal("max_grant_window_s = 43201"),
+			[]string{`"max_grant_window_s"`, "between 0 and 43200 seconds", "got 43201"},
+		},
+		{
+			"negative grant window",
+			withGlobal("max_grant_window_s = -1"),
+			[]string{`"max_grant_window_s"`, "got -1"},
+		},
 	})
+}
+
+// TestGrantWindowBounds pins both edges of the authorisation window this
+// provider may grant a remote claim, and the default that grants none.
+func TestGrantWindowBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		toml string
+		want int
+	}{
+		{"absent", baseConfig(), 0},
+		{"zero", withGlobal("max_grant_window_s = 0"), 0},
+		{"one second", withGlobal("max_grant_window_s = 1"), 1},
+		{"the whole ceiling", withGlobal("max_grant_window_s = 43200"), 43200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadFrom(t, tc.toml)
+			if err != nil {
+				t.Fatalf("Load rejected a valid grant window: %v", err)
+			}
+			if cfg.MaxGrantWindowS != tc.want {
+				t.Errorf("max_grant_window_s = %d, want %d", cfg.MaxGrantWindowS, tc.want)
+			}
+		})
+	}
 }
 
 func TestLoadRejectsInvalidProjectNumber(t *testing.T) {

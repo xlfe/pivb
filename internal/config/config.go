@@ -36,6 +36,10 @@ const (
 	// left when it is served, so it can complete a full STS exchange. It is the
 	// same floor internal/core enforces at serve time (reuseValidityFloor).
 	minRemainingValidityS = 60
+	// maxGrantWindowCeilingS is the longest authorisation window an operator may
+	// let this provider grant a claim: twelve hours, so a window can cover a
+	// working day's session but never outlive one.
+	maxGrantWindowCeilingS = 43200
 )
 
 // migrationDoc is named by the single migration error for retired keys.
@@ -64,13 +68,21 @@ var retiredTopLevelKeys = map[string]struct{}{
 var retiredSuffixes = []string{".broker_sa", ".key_id", ".project_id", ".numeric_project_id"}
 
 type Config struct {
-	PIVSlot   string           `toml:"piv_slot"`
-	PINCache  string           `toml:"pin_cache"`
-	NotifyCmd []string         `toml:"notify_cmd"`
-	GnuPGHome string           `toml:"gnupg_home"`
-	WIF       WIF              `toml:"wif"`
-	Keys      map[string]Key   `toml:"keys"`
-	Aliases   map[string]Alias `toml:"aliases"`
+	PIVSlot   string   `toml:"piv_slot"`
+	PINCache  string   `toml:"pin_cache"`
+	NotifyCmd []string `toml:"notify_cmd"`
+	GnuPGHome string   `toml:"gnupg_home"`
+	// MaxGrantWindowS is the longest authorisation window this provider will
+	// grant a ZKA workspace claim. Zero, the default, refuses every claim that
+	// asks to be covered by one. It is provider-level rather than per-alias:
+	// it answers "how long may one touch on this key cover a remote claim",
+	// which the operator of the card decides once. How much of a granted window
+	// an alias can actually spend touch-free is still its own
+	// assertion_reuse_s.
+	MaxGrantWindowS int              `toml:"max_grant_window_s"`
+	WIF             WIF              `toml:"wif"`
+	Keys            map[string]Key   `toml:"keys"`
+	Aliases         map[string]Alias `toml:"aliases"`
 }
 
 type WIF struct {
@@ -224,6 +236,10 @@ func (c *Config) Validate() error {
 	}
 	if c.GnuPGHome != "" && !filepath.IsAbs(c.GnuPGHome) {
 		fail("config key \"gnupg_home\" must be an absolute path when set, got %q", c.GnuPGHome)
+	}
+	if c.MaxGrantWindowS < 0 || c.MaxGrantWindowS > maxGrantWindowCeilingS {
+		fail("config key \"max_grant_window_s\" must be between 0 and %d seconds (0 refuses every claim that asks to be covered by an authorisation window), got %d",
+			maxGrantWindowCeilingS, c.MaxGrantWindowS)
 	}
 
 	if !projectNumberRE.MatchString(c.WIF.ProjectNumber) {

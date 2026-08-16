@@ -365,6 +365,16 @@ func (t *tickClock) advance(d time.Duration) {
 	t.instant = t.instant.Add(d)
 }
 
+// setTo places the clock at an absolute instant, so a test can sit either side
+// of a deadline it read back off a granted window rather than counting the
+// ticks a mint happened to spend getting there. The next read still moves the
+// clock on by a second, so setTo(deadline) is already past it.
+func (t *tickClock) setTo(instant time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.instant = instant
+}
+
 // mintRace runs n identical requests concurrently and holds the signature open
 // until every one of them has recorded its arrival, so the whole group is
 // provably queued behind one touch rather than merely likely to be.

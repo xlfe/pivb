@@ -81,6 +81,13 @@ type SubjectTokenResult struct {
 	// rather than from a fresh touch. It is observability only: the token is
 	// byte-identical to the one that touch produced.
 	Reused bool
+	// GrantedWindowSeconds and GrantedWindowDeadline report the authorisation
+	// window this provider granted the forwarded claim covering this mint, the
+	// deadline as a unix second. Both are zero whenever no window applies: a
+	// local mint, a forwarded mint that asked for none, and a claim whose
+	// window had already ended when the mint arrived.
+	GrantedWindowSeconds  int64
+	GrantedWindowDeadline int64
 }
 
 // SignEvent records the metadata of the last successful signature for
@@ -421,10 +428,20 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	if c.arrivalHook != nil {
 		c.arrivalHook()
 	}
+	// The window this request is covered by is decided once, from the request
+	// and configuration alone, before anything can reach the card. A request
+	// answered from the cache reports the same grant a fresh mint would, so
+	// nothing about a claim's window is remembered between mints. The window is
+	// deliberately outside cacheKey: the key already carries the workspace and
+	// its claim generation, and a re-granted window arrives as a new generation.
+	grantedSeconds, grantedDeadline, err := c.grantedWindow(req.ForwardContext, arrival)
+	if err != nil {
+		return SubjectTokenResult{}, err
+	}
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
 
-	if result, ok := c.serveAuthorised(cacheKey, req, arrival, aliasReuse); ok {
+	if result, ok := c.serveAuthorised(cacheKey, req, arrival, aliasReuse, grantedSeconds, grantedDeadline); ok {
 		return result, nil
 	}
 	pin, err := c.takePIN()
@@ -498,7 +515,7 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	// The touch took seconds, so the instant the assertion became authorised is
 	// this one, not the pre-sign now that dated its claims.
 	completedAt := c.now().UTC()
-	entry := c.newCacheEntry(cacheKey, token, claims.ExpiresAt(), completedAt, aliasReuse, serial, signedKid, signedSPKI)
+	entry := c.newCacheEntry(cacheKey, token, claims.ExpiresAt(), completedAt, aliasReuse, grantedDeadline, serial, signedKid, signedSPKI)
 	c.mu.Lock()
 	route := "local"
 	if req.ForwardContext.OperationID != "" {
@@ -511,7 +528,10 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	if inserted {
 		c.wakeNotifier()
 	}
-	return SubjectTokenResult{IDToken: token, ExpiresAt: claims.ExpiresAt(), Serial: serial, KeyID: signedKid, SPKIDER: signedSPKI}, nil
+	return SubjectTokenResult{
+		IDToken: token, ExpiresAt: claims.ExpiresAt(), Serial: serial, KeyID: signedKid, SPKIDER: signedSPKI,
+		GrantedWindowSeconds: grantedSeconds, GrantedWindowDeadline: unixOrZero(grantedDeadline),
+	}, nil
 }
 
 // DescribeForwardProvider returns the non-secret policy and exact public card
@@ -544,8 +564,9 @@ func (c *Core) DescribeForwardProvider(ctx context.Context) (forwardapi.Descript
 	provider := c.cfg.Provider()
 	return forwardapi.Description{
 		Version: forwardapi.ProtocolVersion, ProviderResource: provider.Resource(), IssuerURI: provider.IssuerURI,
-		Aliases: aliases,
-		Card:    forwardapi.CardIdentity{Serial: serial, KeyID: kid, SPKIDER: append([]byte(nil), cert.RawSubjectPublicKeyInfo...)},
+		Aliases:         aliases,
+		Card:            forwardapi.CardIdentity{Serial: serial, KeyID: kid, SPKIDER: append([]byte(nil), cert.RawSubjectPublicKeyInfo...)},
+		MaxGrantWindowS: int64(c.cfg.MaxGrantWindowS),
 	}, nil
 }
 
@@ -561,7 +582,7 @@ func (c *Core) ForwardPolicy() forwardapi.Policy {
 	provider := c.cfg.Provider()
 	return forwardapi.Policy{
 		Version: forwardapi.ProtocolVersion, ProviderResource: provider.Resource(), IssuerURI: provider.IssuerURI,
-		Aliases: aliases, EnrolledKeys: keys,
+		Aliases: aliases, EnrolledKeys: keys, MaxGrantWindowS: int64(c.cfg.MaxGrantWindowS),
 	}
 }
 

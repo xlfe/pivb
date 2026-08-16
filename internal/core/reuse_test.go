@@ -211,12 +211,17 @@ func TestReuseKeyCoversEveryRequestField(t *testing.T) {
 	// request rather than one requester, and every forwarded mint carries new
 	// ones. ProviderNodeID is the daemon's own asserted identity, constant for
 	// the daemon and absent from the assertion it signs. RouteSocket is the
-	// caller's hint; the local branch takes the route from the attachment.
+	// caller's hint; the local branch takes the route from the attachment. The
+	// authorisation window is outside it for a different reason: one claim
+	// generation carries one window by construction, and a re-granted window
+	// arrives as a new generation, which is already in the key.
 	shared := map[string]func(*SubjectTokenRequest){
 		"operation id":       func(r *SubjectTokenRequest) { r.ForwardContext.OperationID = strings.Repeat("7", 32) },
 		"provider attach id": func(r *SubjectTokenRequest) { r.ForwardContext.ProviderAttachID = strings.Repeat("8", 32) },
 		"provider node id":   func(r *SubjectTokenRequest) { r.ForwardContext.ProviderNodeID = strings.Repeat("6", 32) },
 		"caller route hint":  func(r *SubjectTokenRequest) { r.RouteSocket = "/run/zka/ignored.sock" },
+		"window seconds":     func(r *SubjectTokenRequest) { r.ForwardContext.WindowSeconds = 900 },
+		"window deadline":    func(r *SubjectTokenRequest) { r.ForwardContext.WindowDeadline = testNowUnix + 900 },
 	}
 	for name, mutate := range shared {
 		t.Run("shared despite "+name, func(t *testing.T) {

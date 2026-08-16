@@ -126,6 +126,7 @@ func (a *API) writeCoreError(w http.ResponseWriter, r *http.Request, alias strin
 	var unknownAlias *core.UnknownAliasError
 	var mismatch *core.RequestMismatchError
 	var invalidSource *core.RequestSourceError
+	var windowErr *core.WindowNotAllowedError
 	var policyErr *attachment.PolicyError
 	var pinErr *pivsigner.PINError
 	var upstreamErr *tokenapi.APIError
@@ -166,6 +167,10 @@ func (a *API) writeCoreError(w http.ResponseWriter, r *http.Request, alias strin
 	case errors.As(err, &mismatch):
 		a.logger().Warn("subject-token request mismatched configuration", append(attrs, "field", mismatch.Field)...)
 		writeError(w, http.StatusForbidden, err.Error(), CodeConfig, "regenerate the credential file with `pivb wif credentials`")
+	case errors.As(err, &windowErr):
+		a.logger().Warn("subject-token request asked for a window this provider does not grant",
+			append(attrs, "requested_window_s", windowErr.Requested)...)
+		writeError(w, http.StatusForbidden, err.Error(), CodeWindowNotAllowed, core.WindowNotAllowedRemedy)
 	case errors.As(err, &pinErr):
 		a.logger().Warn("subject-token PIN failure", append(attrs, "error", err)...)
 		remedy := pinErr.Remedy

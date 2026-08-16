@@ -55,15 +55,26 @@ func reuseKeyFor(req SubjectTokenRequest, alias config.Alias) reuseKey {
 // Two independent grounds admit an entry. The first is strict concurrency
 // coalescing: this request arrived before that signature completed, so it was
 // queued behind the very touch it now shares, and no wall-clock window is
-// involved. The second is the operator's opt-in reuse window for the alias.
+// involved. The second is the operator's opt-in reuse window for the alias,
+// bounded by the entry's own end so an assertion whose touch-free window was
+// capped by a granted authorisation window stops serving when that grant does,
+// however much of the alias window is still unspent.
 // Either way the served token is the byte-identical one that touch produced.
-func (c *Core) serveAuthorised(key reuseKey, req SubjectTokenRequest, arrival time.Time, aliasReuse time.Duration) (SubjectTokenResult, bool) {
+//
+// grantedSeconds and grantedDeadline are what this provider grants the request
+// in hand, not what the entry was minted under. They are reported back, never
+// consulted for admission: a re-granted window arrives as a new claim
+// generation, which is a different entry.
+func (c *Core) serveAuthorised(key reuseKey, req SubjectTokenRequest, arrival time.Time, aliasReuse time.Duration, grantedSeconds int64, grantedDeadline time.Time) (SubjectTokenResult, bool) {
 	now := c.now().UTC()
 	c.mu.Lock()
 	entry := c.cache[key]
-	admit := entry != nil && entry.expiresAt.Sub(now) >= reuseValidityFloor &&
-		((c.singleFlight && !entry.completedAt.Before(arrival)) ||
-			(aliasReuse > 0 && now.Sub(entry.completedAt) <= aliasReuse))
+	admit := false
+	if entry != nil && entry.expiresAt.Sub(now) >= reuseValidityFloor {
+		coalesced := c.singleFlight && !entry.completedAt.Before(arrival)
+		reusable := aliasReuse > 0 && now.Sub(entry.completedAt) <= aliasReuse && now.Before(entry.windowEndsAt)
+		admit = coalesced || reusable
+	}
 	var snapshot []string
 	if admit {
 		snapshot = append([]string(nil), entry.readers...)
@@ -87,13 +98,15 @@ func (c *Core) serveAuthorised(key reuseKey, req SubjectTokenRequest, arrival ti
 		return SubjectTokenResult{}, false
 	}
 	result := SubjectTokenResult{
-		IDToken:        string(entry.token),
-		ExpiresAt:      entry.expiresAt,
-		Serial:         entry.serial,
-		KeyID:          entry.keyID,
-		SPKIDER:        append([]byte(nil), entry.spki...),
-		ForwardContext: req.ForwardContext,
-		Reused:         true,
+		IDToken:               string(entry.token),
+		ExpiresAt:             entry.expiresAt,
+		Serial:                entry.serial,
+		KeyID:                 entry.keyID,
+		SPKIDER:               append([]byte(nil), entry.spki...),
+		ForwardContext:        req.ForwardContext,
+		Reused:                true,
+		GrantedWindowSeconds:  grantedSeconds,
+		GrantedWindowDeadline: unixOrZero(grantedDeadline),
 	}
 	// A hit deliberately spends no PIN: it neither reaches the card nor needs
 	// to, so it keeps working under pin_cache = "never" after the single mint
@@ -106,7 +119,10 @@ func (c *Core) serveAuthorised(key reuseKey, req SubjectTokenRequest, arrival ti
 // newCacheEntry prepares the entry a completed mint leaves behind, or nil when
 // this daemon must keep nothing. It enumerates readers, so the caller holds
 // mintMu and no other lock.
-func (c *Core) newCacheEntry(key reuseKey, token string, expiresAt, completedAt time.Time, aliasReuse time.Duration, serial uint32, keyID string, spki []byte) *cacheEntry {
+//
+// grantedDeadline is the end of the authorisation window this mint was covered
+// by, or the zero time when it was covered by none.
+func (c *Core) newCacheEntry(key reuseKey, token string, expiresAt, completedAt time.Time, aliasReuse time.Duration, grantedDeadline time.Time, serial uint32, keyID string, spki []byte) *cacheEntry {
 	c.mu.RLock()
 	singleFlight := c.singleFlight
 	c.mu.RUnlock()
@@ -131,8 +147,30 @@ func (c *Core) newCacheEntry(key reuseKey, token string, expiresAt, completedAt 
 		keyID:        keyID,
 		spki:         append([]byte(nil), spki...),
 		readers:      readers,
-		windowEndsAt: completedAt.Add(aliasReuse),
+		windowEndsAt: touchFreeUntil(completedAt, aliasReuse, grantedDeadline),
 	}
+}
+
+// touchFreeUntil is how long this daemon may answer byte-identical requests
+// from one signature: whichever ends sooner of the alias's own reuse window
+// and the authorisation window this mint was granted.
+//
+// Taking the earlier of the two is what makes a grant one-directional. It can
+// only shorten a window, never open one — at assertion_reuse_s = 0 the alias
+// window ends at completedAt, so an entry stays coalesce-only however long the
+// grant is, because a remote claim cannot buy touch-free minting the card's
+// own operator did not configure. A grant that ran out while the operator was
+// touching leaves the same coalesce-only entry rather than a window that has
+// already closed.
+func touchFreeUntil(completedAt time.Time, aliasReuse time.Duration, grantedDeadline time.Time) time.Time {
+	endsAt := completedAt.Add(aliasReuse)
+	if grantedDeadline.IsZero() || !grantedDeadline.Before(endsAt) {
+		return endsAt
+	}
+	if grantedDeadline.Before(completedAt) {
+		return completedAt
+	}
+	return grantedDeadline
 }
 
 // insertLocked keeps a completed mint's assertion unless an invalidation has

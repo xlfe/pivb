@@ -228,6 +228,13 @@ func TestSubjectTokenErrorMapping(t *testing.T) {
 			wantCode:   CodeConfig,
 		},
 		{
+			name:       "window this provider does not grant",
+			err:        &core.WindowNotAllowedError{Requested: 900},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeWindowNotAllowed,
+			wantRemedy: core.WindowNotAllowedRemedy,
+		},
+		{
 			name:       "PIN failure",
 			err:        &pivsigner.PINError{Retries: 2, Err: errors.New("wrong"), Remedy: "run pivb unlock"},
 			wantStatus: http.StatusConflict,

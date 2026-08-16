@@ -1,6 +1,22 @@
 piv_slot = "9c"
 pin_cache = "session" # or "never": consume the cached PIN on each mint
 notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
+# The longest authorisation window this provider will grant a remote claim,
+# 0..43200, default 0.
+#
+# A window is a ZKA workspace claim's operator-granted touch-free period: the
+# origin asks that a forwarded mint be covered for so many seconds from a fixed
+# anchor, and this key's operator decides how much of that to honour. At 0 this
+# provider grants none and refuses any claim that asks to be covered by one
+# outright (PIVB_WINDOW_NOT_ALLOWED); above 0 a claim is granted the lesser of
+# what it asked for and this value, ending at the anchor the claim set rather
+# than at the mint.
+#
+# It bounds the window, not the touch-free minting inside it: how much of a
+# granted window a forwarded mint can actually spend without a touch is still
+# that alias's assertion_reuse_s, and at 0 every mint costs a touch however long
+# the window is. A window can only shorten touch-free reuse, never create it.
+max_grant_window_s = 0
 # Optional. systemd --user does not read shell startup files, so set this when
 # the contending scdaemon uses a non-default GnuPG home. Existence and access
 # are checked lazily only when recovery needs GnuPG.

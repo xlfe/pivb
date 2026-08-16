@@ -15,8 +15,17 @@ import (
 	"github.com/xlfe/pivb/internal/uds"
 )
 
+// forwardCore is the daemon seam behind the forwarding socket, in the same
+// shape as wifapi's: narrow enough that a test can stand where the card does.
+type forwardCore interface {
+	SubjectToken(context.Context, core.SubjectTokenRequest) (core.SubjectTokenResult, error)
+	ForwardPolicy() forwardapi.Policy
+	DescribeForwardProvider(context.Context) (forwardapi.Description, error)
+	InvalidateWorkspace(workspaceID string, maxGeneration uint64) int
+}
+
 type forwardBackend struct {
-	core   *core.Core
+	core   forwardCore
 	logger *slog.Logger
 }
 
@@ -40,17 +49,6 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 	if !validForwardContext(fc) {
 		return forwardapi.MintResponse{}, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: "forwarded PIVB request lacks authenticated ZKA context", Remedy: "upgrade and re-claim the PIVB credential bundle"}
 	}
-	// Protocol 3 carries authorisation windows, but no provider enforces one
-	// yet. Until the enforcement work package lands, a mint that asks to be
-	// covered by a window is refused rather than served without the coverage
-	// it asked for.
-	if fc.WindowSeconds > 0 {
-		return forwardapi.MintResponse{}, &tokenapi.APIError{
-			Status: http.StatusForbidden, Code: tokenapi.CodeWindowNotAllowed,
-			Message: "a grant window was requested but this provider does not allow windows",
-			Remedy:  "enable grant windows in the provider pivb configuration or re-claim without a window",
-		}
-	}
 	result, err := b.core.SubjectToken(ctx, core.SubjectTokenRequest{
 		Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail: req.ImpersonatedEmail, RequestSource: *req.RequestSource,
@@ -68,6 +66,12 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 		"operation_id", fc.OperationID,
 		"serial", result.Serial, "key_id", result.KeyID,
 	}
+	// A granted window is named only when there is one, so the ordinary
+	// touch-per-mint line stays exactly what it was.
+	if result.GrantedWindowSeconds > 0 {
+		attrs = append(attrs, "granted_window_s", result.GrantedWindowSeconds,
+			"granted_window_deadline", result.GrantedWindowDeadline)
+	}
 	// The peer on this socket is the local zka daemon relaying the request,
 	// not the agent that started it; the ZKA context above names that.
 	if peer, ok := uds.PeerFromContext(ctx); ok {
@@ -79,6 +83,10 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 		Card:           forwardapi.CardIdentity{Serial: result.Serial, KeyID: result.KeyID, SPKIDER: result.SPKIDER},
 		ExpectedCard:   req.ExpectedCard,
 		ForwardContext: req.ForwardContext,
+		// What the provider granted travels top-level: the origin rewrites the
+		// forwarded context when it binds this response to its own route.
+		GrantedWindowSeconds:  result.GrantedWindowSeconds,
+		GrantedWindowDeadline: result.GrantedWindowDeadline,
 	}, nil
 }
 
@@ -105,10 +113,16 @@ func mapForwardError(err error) *tokenapi.APIError {
 	var unknownAlias *core.UnknownAliasError
 	var mismatch *core.RequestMismatchError
 	var invalidSource *core.RequestSourceError
+	var windowErr *core.WindowNotAllowedError
 	var pinErr *pivsigner.PINError
 	switch {
 	case errors.As(err, &existing):
 		return existing
+	case errors.As(err, &windowErr):
+		return &tokenapi.APIError{
+			Status: http.StatusForbidden, Code: tokenapi.CodeWindowNotAllowed, Message: err.Error(),
+			Remedy: core.WindowNotAllowedRemedy,
+		}
 	case errors.Is(err, core.ErrLocked):
 		return &tokenapi.APIError{Status: http.StatusConflict, Code: tokenapi.CodeLocked, Message: err.Error(), Remedy: "run `pivb unlock` on the YubiKey provider host"}
 	case errors.As(err, &invalidSource), errors.As(err, &unknownAlias), errors.As(err, &mismatch):
