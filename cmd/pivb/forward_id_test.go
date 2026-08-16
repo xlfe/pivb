@@ -58,6 +58,42 @@ func TestForwardContextAcceptsZKAAttachmentIDLengths(t *testing.T) {
 	}
 }
 
+// A forwarded mint either asks to be covered by a whole authorisation window
+// or asks for none. Half a window names no interval a provider could enforce,
+// so it is refused with the other malformed contexts.
+func TestForwardContextRequiresWholeWindows(t *testing.T) {
+	valid := forwardapi.ForwardContext{
+		OriginNodeID: strings.Repeat("a", 32), WorkspaceID: strings.Repeat("b", 32), Bundle: "work",
+		ClaimGeneration: 1, ProviderNodeID: strings.Repeat("c", 32), OperationID: strings.Repeat("e", 32),
+	}
+
+	tests := []struct {
+		name     string
+		window   int64
+		deadline int64
+		want     bool
+	}{
+		{name: "no window", want: true},
+		{name: "whole window", window: 900, deadline: 1785586770, want: true},
+		{name: "length without deadline", window: 900},
+		{name: "deadline without length", deadline: 1785586770},
+		{name: "negative length", window: -1, deadline: 1785586770},
+		{name: "negative deadline", window: 900, deadline: -1},
+		{name: "negative pair", window: -1, deadline: -1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			context := valid
+			context.WindowSeconds = test.window
+			context.WindowDeadline = test.deadline
+			if got := validForwardContext(context); got != test.want {
+				t.Errorf("validForwardContext() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestForwardIDValidation(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	ProtocolVersion = 2
+	ProtocolVersion = 3
 	maxRequestBody  = 16 << 10
 	// Hardware minting is bounded at 23 seconds (one-second lease acquisition,
 	// 20-second hardware deadline, two-second worker drain), leaving two
@@ -38,6 +38,9 @@ type CardIdentity struct {
 
 type AliasBinding struct {
 	Target string `json:"target"`
+	// AssertionLifetimeS advertises how long one touch's assertion may be
+	// reused for this alias. Zero means every mint costs a touch.
+	AssertionLifetimeS int64 `json:"assertion_lifetime_s,omitempty"`
 }
 
 type EnrolledKey struct {
@@ -51,6 +54,9 @@ type Policy struct {
 	IssuerURI        string                  `json:"issuer_uri"`
 	Aliases          map[string]AliasBinding `json:"aliases"`
 	EnrolledKeys     []EnrolledKey           `json:"enrolled_keys"`
+	// MaxGrantWindowS is the longest authorisation window this provider will
+	// grant a claim. Zero means the provider grants no windows at all.
+	MaxGrantWindowS int64 `json:"max_grant_window_s,omitempty"`
 }
 
 type Description struct {
@@ -59,6 +65,7 @@ type Description struct {
 	IssuerURI        string                  `json:"issuer_uri"`
 	Aliases          map[string]AliasBinding `json:"aliases"`
 	Card             CardIdentity            `json:"card"`
+	MaxGrantWindowS  int64                   `json:"max_grant_window_s,omitempty"`
 }
 
 type ForwardContext struct {
@@ -69,6 +76,12 @@ type ForwardContext struct {
 	ProviderNodeID   string `json:"provider_node_id"`
 	ProviderAttachID string `json:"provider_attachment_id,omitempty"`
 	OperationID      string `json:"operation_id"`
+	// WindowSeconds is the authorisation window the claim asks this mint to be
+	// covered by, and WindowDeadline is the absolute unix second the claim
+	// anchored that window to. They travel together: both zero means the mint
+	// asks for no window at all.
+	WindowSeconds  int64 `json:"window_s,omitempty"`
+	WindowDeadline int64 `json:"window_deadline,omitempty"`
 }
 
 type MintRequest struct {
@@ -88,12 +101,32 @@ type MintResponse struct {
 	Card           CardIdentity   `json:"card"`
 	ExpectedCard   CardIdentity   `json:"expected_card"`
 	ForwardContext ForwardContext `json:"forward_context"`
+	// The granted window is top-level rather than inside ForwardContext
+	// because an origin rewrites the whole forwarded context when it binds a
+	// response to its own route; what the provider granted must survive that.
+	GrantedWindowSeconds  int64 `json:"granted_window_s,omitempty"`
+	GrantedWindowDeadline int64 `json:"granted_window_deadline,omitempty"`
+}
+
+// InvalidateRequest drops every reusable assertion a provider still holds for
+// one ZKA workspace claim. ClaimGeneration bounds the purge to that generation
+// and below; zero means every generation, which is what a release sends.
+type InvalidateRequest struct {
+	Version         int    `json:"version"`
+	WorkspaceID     string `json:"workspace_id"`
+	ClaimGeneration uint64 `json:"claim_generation"`
+}
+
+type InvalidateResponse struct {
+	Version int `json:"version"`
+	Purged  int `json:"purged"`
 }
 
 type Backend interface {
 	Policy(context.Context) (Policy, *tokenapi.APIError)
 	Describe(context.Context) (Description, *tokenapi.APIError)
 	Mint(context.Context, MintRequest) (MintResponse, *tokenapi.APIError)
+	Invalidate(context.Context, InvalidateRequest) (InvalidateResponse, *tokenapi.APIError)
 }
 
 type API struct{ Backend Backend }
@@ -103,6 +136,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/policy", a.policy)
 	mux.HandleFunc("GET /v1/describe", a.describe)
 	mux.HandleFunc("POST /v1/mint", a.mint)
+	mux.HandleFunc("POST /v1/invalidate", a.invalidate)
 	return mux
 }
 
@@ -128,12 +162,12 @@ func (a *API) describe(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) mint(w http.ResponseWriter, r *http.Request) {
 	var req MintRequest
-	if err := jsonhttp.Decode(r, &req, maxRequestBody); err != nil {
-		writeAPIError(w, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: err.Error(), Remedy: "send the fixed PIVB forwarding request shape"})
+	if apiErr := decodeVersionedRequest(r, &req); apiErr != nil {
+		writeAPIError(w, apiErr)
 		return
 	}
 	if req.Version != ProtocolVersion {
-		writeAPIError(w, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: fmt.Sprintf("unsupported PIVB forwarding protocol %d", req.Version), Remedy: "upgrade PIVB and ZKA together"})
+		writeAPIError(w, versionSkewError(req.Version))
 		return
 	}
 	result, apiErr := a.Backend.Mint(r.Context(), req)
@@ -143,6 +177,67 @@ func (a *API) mint(w http.ResponseWriter, r *http.Request) {
 	}
 	result.Version = ProtocolVersion
 	jsonhttp.Write(w, http.StatusOK, result)
+}
+
+func (a *API) invalidate(w http.ResponseWriter, r *http.Request) {
+	var req InvalidateRequest
+	if apiErr := decodeVersionedRequest(r, &req); apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+	if req.Version != ProtocolVersion {
+		writeAPIError(w, versionSkewError(req.Version))
+		return
+	}
+	result, apiErr := a.Backend.Invalidate(r.Context(), req)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+	result.Version = ProtocolVersion
+	jsonhttp.Write(w, http.StatusOK, result)
+}
+
+// decodeVersionedRequest reads one bounded request body and answers a version
+// skew before it answers a shape complaint. A peer one protocol behind sends
+// fields this build has never heard of, so strict decoding alone would report
+// a malformed request and send an operator hunting the wrong fault; the
+// tolerant version peek turns that into "upgrade both sides".
+func decodeVersionedRequest(r *http.Request, dst any) *tokenapi.APIError {
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBody))
+	if err != nil {
+		return badRequestShape(err)
+	}
+	var peek struct {
+		Version *int `json:"version"`
+	}
+	if json.Unmarshal(body, &peek) == nil && peek.Version != nil && *peek.Version != ProtocolVersion {
+		return versionSkewError(*peek.Version)
+	}
+	if err := decodeStrict(body, dst); err != nil {
+		return badRequestShape(err)
+	}
+	return nil
+}
+
+func decodeStrict(body []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("invalid JSON body: multiple values")
+	}
+	return nil
+}
+
+func badRequestShape(err error) *tokenapi.APIError {
+	return &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: err.Error(), Remedy: "send the fixed PIVB forwarding request shape"}
+}
+
+func versionSkewError(version int) *tokenapi.APIError {
+	return &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: fmt.Sprintf("unsupported PIVB forwarding protocol %d", version), Remedy: "upgrade PIVB and ZKA together"}
 }
 
 func writeAPIError(w http.ResponseWriter, err *tokenapi.APIError) {
@@ -229,6 +324,30 @@ func (c *Client) Mint(ctx context.Context, req MintRequest) (MintResponse, error
 		out.ExpectedCard.Serial == 0 || out.ExpectedCard.KeyID == "" || len(out.ExpectedCard.SPKIDER) == 0 ||
 		out.ForwardContext.OriginNodeID == "" || out.ForwardContext.WorkspaceID == "" || out.ForwardContext.OperationID == "" {
 		return MintResponse{}, &ProtocolError{Err: errors.New("PIVB forwarding response is incomplete")}
+	}
+	return out, nil
+}
+
+// Invalidate asks the provider to drop the reusable assertions it holds for a
+// workspace claim. It is safe to call for a claim the provider never served:
+// the provider answers with a purge count of zero.
+func (c *Client) Invalidate(ctx context.Context, req InvalidateRequest) (InvalidateResponse, error) {
+	var out InvalidateResponse
+	req.Version = ProtocolVersion
+	body, err := json.Marshal(req)
+	if err != nil {
+		return out, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://pivb-forward/v1/invalidate", bytes.NewReader(body))
+	if err != nil {
+		return out, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if err := c.do(httpReq, &out); err != nil {
+		return out, err
+	}
+	if out.Version != ProtocolVersion || out.Purged < 0 {
+		return InvalidateResponse{}, &ProtocolError{Err: errors.New("PIVB forwarding invalidation response is incomplete")}
 	}
 	return out, nil
 }

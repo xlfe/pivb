@@ -31,14 +31,15 @@ const peerChainDepth = 5
 
 // Re-export the stable protocol types for compatibility with existing clients.
 const (
-	CodeLocked        = tokenapi.CodeLocked
-	CodeConfig        = tokenapi.CodeConfig
-	CodePIN           = tokenapi.CodePIN
-	CodeSign          = tokenapi.CodeSign
-	CodeUnavailable   = tokenapi.CodeUnavailable
-	CodeRouteRequired = tokenapi.CodeRouteRequired
-	CodeEnv           = tokenapi.CodeEnv
-	CodeInternal      = tokenapi.CodeInternal
+	CodeLocked           = tokenapi.CodeLocked
+	CodeConfig           = tokenapi.CodeConfig
+	CodePIN              = tokenapi.CodePIN
+	CodeSign             = tokenapi.CodeSign
+	CodeUnavailable      = tokenapi.CodeUnavailable
+	CodeRouteRequired    = tokenapi.CodeRouteRequired
+	CodeEnv              = tokenapi.CodeEnv
+	CodeInternal         = tokenapi.CodeInternal
+	CodeWindowNotAllowed = tokenapi.CodeWindowNotAllowed
 )
 
 // SubjectTokenRequest is the fixed request shape. Every field is validated

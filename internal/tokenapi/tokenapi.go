@@ -16,6 +16,9 @@ const (
 	CodeRouteRequired = "PIVB_ROUTE_REQUIRED"
 	CodeEnv           = "PIVB_ENV"
 	CodeInternal      = "PIVB_INTERNAL"
+	// CodeWindowNotAllowed answers a mint that asked to be covered by an
+	// authorisation window this provider will not grant.
+	CodeWindowNotAllowed = "PIVB_WINDOW_NOT_ALLOWED"
 )
 
 // SubjectTokenResponse carries the subject token and its Unix expiry. No

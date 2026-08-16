@@ -40,6 +40,17 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 	if !validForwardContext(fc) {
 		return forwardapi.MintResponse{}, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: "forwarded PIVB request lacks authenticated ZKA context", Remedy: "upgrade and re-claim the PIVB credential bundle"}
 	}
+	// Protocol 3 carries authorisation windows, but no provider enforces one
+	// yet. Until the enforcement work package lands, a mint that asks to be
+	// covered by a window is refused rather than served without the coverage
+	// it asked for.
+	if fc.WindowSeconds > 0 {
+		return forwardapi.MintResponse{}, &tokenapi.APIError{
+			Status: http.StatusForbidden, Code: tokenapi.CodeWindowNotAllowed,
+			Message: "a grant window was requested but this provider does not allow windows",
+			Remedy:  "enable grant windows in the provider pivb configuration or re-claim without a window",
+		}
+	}
 	result, err := b.core.SubjectToken(ctx, core.SubjectTokenRequest{
 		Alias: req.Alias, ExternalAccountAudience: req.ExternalAccountAudience,
 		ImpersonatedEmail: req.ImpersonatedEmail, RequestSource: *req.RequestSource,
@@ -69,6 +80,24 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 		ExpectedCard:   req.ExpectedCard,
 		ForwardContext: req.ForwardContext,
 	}, nil
+}
+
+// Invalidate drops the assertions held for one workspace claim. ZKA calls it
+// when a claim is released or its generation advances, so a released claim
+// stops granting touch-free mints at once instead of when its assertions
+// expire. Unlike a mint, generation zero is meaningful here: it is the release
+// case, "every generation of this workspace".
+func (b forwardBackend) Invalidate(ctx context.Context, req forwardapi.InvalidateRequest) (forwardapi.InvalidateResponse, *tokenapi.APIError) {
+	if !validForwardID(req.WorkspaceID) {
+		return forwardapi.InvalidateResponse{}, &tokenapi.APIError{Status: http.StatusBadRequest, Code: tokenapi.CodeConfig, Message: "forwarded PIVB invalidation lacks an authenticated ZKA workspace", Remedy: "upgrade and re-claim the PIVB credential bundle"}
+	}
+	purged := b.core.InvalidateWorkspace(req.WorkspaceID, req.ClaimGeneration)
+	attrs := []any{"workspace", req.WorkspaceID, "claim_generation", req.ClaimGeneration, "purged", purged}
+	if peer, ok := uds.PeerFromContext(ctx); ok {
+		attrs = append(attrs, "peer_pid", peer.PID)
+	}
+	b.logger.Info("invalidated forwarded PIVB assertions", attrs...)
+	return forwardapi.InvalidateResponse{Version: forwardapi.ProtocolVersion, Purged: purged}, nil
 }
 
 func mapForwardError(err error) *tokenapi.APIError {

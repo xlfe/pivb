@@ -5,7 +5,17 @@ import "github.com/xlfe/pivb/internal/forwardapi"
 func validForwardContext(fc forwardapi.ForwardContext) bool {
 	return validForwardID(fc.OriginNodeID) && validForwardID(fc.WorkspaceID) && validForwardName(fc.Bundle) &&
 		fc.ClaimGeneration != 0 && validForwardID(fc.ProviderNodeID) && validForwardID(fc.OperationID) &&
-		(fc.ProviderAttachID == "" || validForwardAttachmentID(fc.ProviderAttachID))
+		(fc.ProviderAttachID == "" || validForwardAttachmentID(fc.ProviderAttachID)) && validForwardWindow(fc)
+}
+
+// A mint either carries a whole authorisation window — a length and the
+// absolute deadline the claim anchored it to — or carries no window at all.
+// Half a window has no meaning a provider could enforce.
+func validForwardWindow(fc forwardapi.ForwardContext) bool {
+	if fc.WindowSeconds < 0 || fc.WindowDeadline < 0 {
+		return false
+	}
+	return (fc.WindowSeconds == 0) == (fc.WindowDeadline == 0)
 }
 
 func validForwardID(value string) bool {
