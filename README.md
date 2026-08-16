@@ -2,21 +2,25 @@
 
 `pivb` turns a touch-gated, non-exportable RSA-2048 key in YubiKey PIV slot `9c`
 into Google Cloud credentials through Workload Identity Federation. The daemon is
-a **networkless signer**: it mints five-minute RS256 OIDC subject tokens and
-nothing else. A trusted Google auth library runs `pivb subject-token`, receives the
-assertion on stdout, and performs the STS exchange and service-account
-impersonation itself.
+a **networkless signer**: it mints short-lived RS256 OIDC subject tokens and
+nothing else. Assertion validity is per-alias configuration — 300 seconds by
+default, up to an hour and never longer than the access token it exists to buy.
+A trusted Google auth library runs `pivb subject-token`, receives the assertion on
+stdout, and performs the STS exchange and service-account impersonation itself.
 
 pivbd never receives, caches, returns, or logs a Google access token, STS response,
 or Google-issued ID token. It has no AF_INET socket, no Google HTTP client, and no
-TCP listener. The only state it holds is the cached PIV PIN and the metadata of the
-last signature.
+TCP listener. The state it holds is the cached PIV PIN, the metadata of the last
+signature, and — only where an operator configured [touch-free
+reuse](#touch-free-reuse-and-authorisation-windows) or a ZKA authorisation window —
+the assertions those policies still authorise, in memory, zeroized on every path
+that drops them and never written to disk.
 
 ```text
 trusted app → Google auth library → exec `pivb subject-token --alias ro`
                                         ↓ HTTP over $XDG_RUNTIME_DIR/pivb/wif.sock
                                     pivbd → one ephemeral PIV session → RS256 signature
-                                        ↓ five-minute assertion on helper stdout
+                                        ↓ short-lived assertion on helper stdout
         Google auth library → STS → IAM Credentials impersonation → target access token
 ```
 
@@ -43,8 +47,9 @@ supervisor process, not pivbd, and disappears with the supervised launcher.
 ### What this design guarantees
 
 1. No pivb TCP listener exists, on loopback or any other interface.
-2. pivbd holds only the cached PIV PIN and short-lived signing inputs. It holds no
-   Google bearer token.
+2. pivbd holds only the cached PIV PIN, short-lived signing inputs, and the
+   assertions an operator's reuse policy still authorises. It holds no Google
+   bearer token.
 3. The only credential pivbd can mint is a short-lived OIDC assertion for a known
    provider, alias, target service account, and enrolled key.
 4. A subject token minted for one alias cannot impersonate another alias's target,
@@ -55,6 +60,15 @@ supervisor process, not pivbd, and disappears with the supervised launcher.
    then fail, and already-issued Google tokens expire naturally within the hour.
 7. PIV touch and PIN behavior stays recognizable to the operator. No browser login
    and no exportable private key is introduced.
+8. What one touch buys is stated on the prompt that asks for it. By default every
+   *sequential* request costs its own touch; requests that arrive while a
+   byte-identical one is already being signed are answered from the signature
+   they queued behind, because that is the touch they were already waiting on.
+   Where an operator sets `assertion_reuse_s` or grants a ZKA authorisation
+   window, the touch instead buys a stated span of touch-free minting for that
+   exact requester tuple, and the prompt says so before the operator touches.
+   See [Touch-free reuse and authorisation
+   windows](#touch-free-reuse-and-authorisation-windows).
 
 One further property depends on the machine configuration rather than on this
 repository: an agent sandbox can reach only the single explicitly delegated
@@ -109,6 +123,7 @@ Copy [`config.example.toml`](config.example.toml) to `~/.config/pivb/config.toml
 piv_slot = "9c"
 pin_cache = "session" # or "never": consume the cached PIN on each mint
 notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
+max_grant_window_s = 0 # longest authorisation window granted to a ZKA claim
 gnupg_home = "/home/replace-me/.gnupg" # optional absolute custom home
 
 [wif]
@@ -127,6 +142,8 @@ jwk_kid = "replace-with-43-char-base64url-spki-digest1"
 cloud = "gcp" # optional; gcp is the only supported value
 target = "readonly-sa@example-project-id.iam.gserviceaccount.com"
 lifetime_s = 3600 # target access-token lifetime, 600..3600
+assertion_lifetime_s = 300 # assertion validity, 300..min(3600, lifetime_s)
+assertion_reuse_s = 0 # touch-free seconds after a touch; 0 touches every credential
 
 [aliases.deploy]
 target = "deployment-sa@example-project-id.iam.gserviceaccount.com"
@@ -157,6 +174,11 @@ signed claim or a generated Google artifact:
   and must be unique across aliases: one alias, one target service account.
 - `lifetime_s` is 600 through 3600 seconds. One hour is a security cap and is not
   raisable even where an organization policy permits twelve-hour tokens.
+- `assertion_lifetime_s` is 300 through `min(3600, lifetime_s)`, default 300;
+  `assertion_reuse_s` is 0 through `assertion_lifetime_s - 90`, default 0; and
+  `max_grant_window_s` is 0 through 43200, default 0. All three decide how far
+  one touch reaches, so they have their own section: [Touch-free reuse and
+  authorisation windows](#touch-free-reuse-and-authorisation-windows).
 
 Only RSA-2048/RS256 is supported. The audiences are derived from
 `project_number`/`pool_id`/`provider_id` and are never configured as free-form
@@ -188,6 +210,113 @@ pivb: config key(s) listen_metadata belong to the retired metadata/broker archit
 
 There is no compatibility shim. Silently accepting old trust configuration risks
 running the wrong credential path.
+
+## Touch-free reuse and authorisation windows
+
+By default a touch buys one credential. Three keys change that, and all three are
+consent settings rather than cache tuning — each one widens what the operator
+approves when they touch the card:
+
+| Key | Scope | Default | What it decides |
+|---|---|---|---|
+| `assertion_reuse_s` | per alias | `0` | how long after a touch this alias answers byte-identical requests without another one |
+| `assertion_lifetime_s` | per alias | `300` | how long one minted assertion stays exchangeable at STS |
+| `max_grant_window_s` | provider-wide | `0` | the longest [ZKA claim authorisation window](#zka-forwarding-provider) this card's operator will grant |
+
+Independently of all three, requests that arrive while a byte-identical request is
+already being signed are answered from that one signature. They were queued behind
+that touch, so they are part of what it authorised; this is on by default and is
+the only reuse that happens at `assertion_reuse_s = 0`. Two *sequential* requests
+never share a signature unless the alias sets `assertion_reuse_s` above zero — a
+granted window can shorten that span but never open one.
+
+"Byte-identical" is the full requester tuple: alias, target, external-account
+audience, request-source kind/label/session ID, attachment mode/protocol/route
+socket, the claimed card's serial, key ID and SPKI, and the ZKA origin node,
+workspace, bundle, and claim generation. Anything else is a different requester
+and asks for its own touch.
+
+### The horizon one touch opens
+
+One touch authorises at most
+
+```text
+assertion_lifetime_s + lifetime_s
+```
+
+of downstream credential validity: the assertion stays exchangeable for the first,
+and the last access token it buys lives for the second after that. At the defaults
+that is 300 + 3600 ≈ 65 minutes. `assertion_reuse_s` does not extend the horizon —
+it can only reach as far as the assertion it serves, and is bounded at
+`assertion_lifetime_s - 90` (30 seconds are already spent backdating `iat`, and a
+served assertion must keep 60 seconds of validity so no caller receives one that
+expires mid-exchange). Raising `assertion_lifetime_s` raises the horizon directly,
+which is why its ceiling is `min(3600, lifetime_s)`: an assertion never outlives
+the credential it exists to buy.
+
+### What the operator sees
+
+The touch prompt states what the touch grants before it is given: the alias and
+target as always, the ZKA origin/workspace/bundle/generation for a forwarded mint,
+`authorises <alias> touch-free for <span>` whenever `assertion_reuse_s` is set,
+and `assertion valid <duration>` whenever the alias configures a non-default
+assertion lifetime.
+
+`notify_cmd` receives two further notices per window: `window for <alias> expires
+in 60s`, and `window for <alias> expired; next mint needs a touch`. A window no
+longer than that 60-second lead gets the closing notice only. Both are operator
+information; nothing is refused when they are missed.
+
+`pivb status` reports open windows in `reuse_windows` — alias, session ID, the
+serial that authorised them, `window_ends_at`, and the assertion's own
+`token_expires_at` — alongside the rolling `mints` counters, whose
+`signatures_60m` is the subset that actually spent a touch. `--format waybar`
+folds the window closing soonest into the tooltip as `Window: <alias> <time>
+left`, because that is the next request that will ask for a touch.
+
+### Every path that drops a held assertion
+
+Each of these zeroizes the token bytes before dropping the entry:
+
+- `pivb lock`, which also clears the PIN and last-signature metadata.
+- A PIN the card rejects: a PIN that is no longer valid leaves no basis for
+  trading on what it authorised.
+- A card swap. Whenever a card authenticates — at `pivb unlock`, or through the
+  PIN verification inside a signature — assertions held for any other serial are
+  dropped, because the touches the previous key gave are not the operator's
+  current consent.
+- A change in the reader set, checked both on every cache hit before the entry is
+  served and by a 2-second poll while anything is held, so unplugging the YubiKey
+  closes the windows without waiting for the next request.
+- `POST /v1/invalidate` from ZKA, which the origin fires when a claim is released
+  or its generation advances. A generation watermark closes the matching race: a
+  mint already inside the card when the invalidation arrives cannot insert its
+  result afterwards.
+- The window's own end, and the assertion's own expiry, whichever comes first.
+- Eviction, at 64 held entries, oldest signature first.
+- Daemon restart. Nothing here survives it; none of it is ever on disk.
+
+`pin_cache = "never"` is deliberately orthogonal. A cache hit reaches no card and
+spends no PIN, so it keeps working after the single mint that PIN was allowed to
+buy. If you want a PIN per credential, leave `assertion_reuse_s` at 0.
+
+### What purging is not
+
+Dropping a held assertion stops *new* exchanges from that signature. It does not
+revoke an assertion a caller already received, and it certainly does not revoke a
+Google access token minted from one — Google has no revocation API, so those
+expire on their own within `lifetime_s`. Closing a window narrows the future, not
+the past.
+
+### The assumption this rests on
+
+Reuse relies on Google STS accepting the same subject token more than once inside
+its validity. This is the same property Google's own executable-source
+`output_file` caching design depends on, and it is an external behaviour, not
+something this repository can enforce. Treat it as verified only against your
+provider: acceptance step (e) in the [sandbox acceptance
+tests](#sandbox-acceptance-tests) makes a live `gcloud` call on a cache-hit
+assertion for exactly this reason.
 
 ## One-time YubiKey setup
 
@@ -406,7 +535,11 @@ must survive a NixOS rebuild. The generator takes the audience, target, and
 lifetime from config and never accepts a caller-supplied impersonation URL. The
 credential source deliberately contains no `output_file` — caching subject tokens
 on disk is prohibited, and the helper refuses to run if a hand-edited file sets
-`GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE`.
+`GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE`. [Touch-free
+reuse](#touch-free-reuse-and-authorisation-windows) does not soften that: reuse
+lives in pivbd's memory under the operator's own keys, where it is bounded,
+announced, and purgeable, never in a client-side disk cache the daemon can
+neither see nor retire.
 
 The file holds no private key and no bearer token, but its `command` decides which
 executable receives credential requests. Treat it as tamper-sensitive.
@@ -548,10 +681,21 @@ is the key the cached PIN was verified against; `last_sign_serial` is the key th
 last signed. `mints` carries the rolling in-memory mint rate — `total_1m`,
 `total_5m`, `total_60m`, `signatures_60m`, and per-alias and per-session counts
 for the last hour — and is omitted entirely when nothing was minted in that hour.
+`signatures_60m` is the subset that spent a touch; the difference between it and
+`total_60m` is what reuse saved.
+
+`reuse_windows` lists the open [touch-free
+windows](#touch-free-reuse-and-authorisation-windows), soonest to close first,
+each with its `alias`, `session_id`, the `serial` that authorised it,
+`window_ends_at`, and the held assertion's own `token_expires_at`. It is omitted
+when none is open, and entries that exist only to coalesce concurrent requests
+are not windows and never appear. No token material is reported.
 
 `--format waybar` emits a `text`/`tooltip`/`class`/`alt` object with class `ready`,
 `locked`, or `unavailable`, and exits **0** even when the daemon is down so the bar
-keeps rendering. Plain `--format json` without `--watch` exits nonzero if the
+keeps rendering. Its tooltip carries the mint counters and a countdown on the
+window that closes soonest (`Window: ro 4m12s left`) — the next mint that will
+ask for a touch. Plain `--format json` without `--watch` exits nonzero if the
 daemon is unreachable; with `--watch` it emits `{"unavailable":true,"error":"…"}`
 and keeps polling.
 
@@ -599,6 +743,7 @@ Stable codes (the code does not determine HTTP status by itself):
 | `PIVB_UNAVAILABLE` | 503 | the selected local or workspace route cannot be reached or closes |
 | `PIVB_LOCKED` | 409 | no cached PIN; run `pivb unlock` on the trusted host |
 | `PIVB_PIN` | 409/403 | PIN rejected, or refusing to spend the final PIN retry |
+| `PIVB_WINDOW_NOT_ALLOWED` | 403 | a mint asked to be covered by an authorisation window this provider's `max_grant_window_s` does not grant — raise it, or re-claim without `--window` |
 | `PIVB_SIGN` | 502/503 | generic PIV/signing failure, or retryable card contention/insufficient touch window |
 | `PIVB_INTERNAL` | 500 | malformed daemon response or an unclassified daemon error |
 | `PIVB_PEER` | 403 | the socket peer's real UID is not the daemon's — surfaced from the UDS layer |
@@ -673,8 +818,8 @@ already obtained by an auth library; those expire within the configured lifetime
 ### ZKA forwarding provider
 
 `forward.sock` is a trusted-host, versioned HTTP-over-Unix-socket API. Its
-current wire version is 2; strict decoding makes mixed PIVB/ZKA versions fail
-closed with an upgrade-together error. It has three operations:
+current wire version is **3**; strict decoding makes mixed PIVB/ZKA versions fail
+closed with an upgrade-together error. It has four operations:
 
 - `GET /v1/policy` returns the card-free provider/issuer, alias bindings, and
   enrolled serial/key-ID pairs so an origin can reject a mismatched claim.
@@ -682,6 +827,37 @@ closed with an upgrade-together error. It has three operations:
   bindings, and the live slot-9c serial, JWK key ID, and SPKI.
 - `POST /v1/mint` accepts one complete semantic PIVB mint request with a required
   expected card and authenticated ZKA routing context.
+- `POST /v1/invalidate` drops every held assertion for one workspace claim.
+  `claim_generation` bounds the purge to that generation and below; zero means
+  every generation, which is what a release sends. ZKA calls it best-effort when
+  a claim is released or its generation advances; it never gates a claim.
+
+Both discovery operations advertise each alias's effective `assertion_lifetime_s`
+and this provider's `max_grant_window_s`, so an origin can see what it will be
+granted before it claims. A mint request carries the window the claim asks to be
+covered by (`window_s` plus the absolute `window_deadline` it is anchored to,
+both or neither); the response reports what was actually granted in top-level
+`granted_window_s`/`granted_window_deadline`, outside the forwarded context
+because an origin rewrites that context wholesale when it binds the response to
+its own route. The provider grants `min(requested, max_grant_window_s)` from the
+claim's own anchor, so re-asking near the end cannot lengthen a window; a
+provider whose maximum is 0 refuses with `PIVB_WINDOW_NOT_ALLOWED`, and a window
+that has already ended is treated as no window rather than as a refusal.
+
+Both sides peek at the `version` field before strict decoding, because a peer one
+version behind sends fields this build has never heard of and a strict decode
+would report that as a malformed request instead of as skew. Anything this build
+rejects for its version says so and tells you to upgrade PIVB and ZKA together.
+
+The peek is necessarily one-directional, so **a v2 pivbd answering a v3 caller**
+is the one case that misreports itself. A windowed v3 mint reaches its strict
+decode first and comes back as `invalid JSON body: json: unknown field
+"window_s"` with the remedy "send the fixed PIVB forwarding request shape" —
+which is not the problem. A windowless v3 mint decodes cleanly and does report
+`unsupported PIVB forwarding protocol 3`, and `POST /v1/invalidate` simply 404s.
+Read any of the three as a half-upgraded machine. Upgrade pivb and zka together
+per machine, then release and re-claim every PIVB bundle: a manifest persisted
+at v2 fails closed until it is.
 
 It has no PIN, unlock, control, raw-signing, digest, APDU, or PC/SC operation.
 The provider rejects an alias, target, audience, or live card that differs from
@@ -689,6 +865,19 @@ the request before signing. The receiving pivbd independently verifies the forwa
 signature, SPKI, issuer, audience, claims, lifetime, and local enrollment before
 it returns the token to its ordinary `wif.sock` caller. Structured PIVB error codes,
 including `PIVB_LOCKED` and `PIVB_UNAVAILABLE`, survive the extra hop.
+
+Two of those checks are per-alias configuration on both ends of the route, so
+they are reported as disagreements rather than as attacks. An assertion whose
+validity is not the `assertion_lifetime_s` this origin configures for the alias
+is refused with the two numbers and the remedy "align `assertion_lifetime_s` for
+this alias in the origin and provider pivb configurations, then retry" — the
+operator is told which key to fix, not that the provider misbehaved. Freshness is checked against
+the origin's own clock allowing two clock skews, plus this origin's own
+`assertion_reuse_s`: an origin that opted the alias into reuse accepts an
+assertion that much more cache-aged, because the provider is entitled to answer
+from the signature that same window authorised. At `assertion_reuse_s = 0` the
+bound is exactly the two-skew one, so an origin never accepts reuse it did not
+itself configure.
 
 The forwarding socket is not a sandbox capability. A machine launcher exposes
 only the ordinary four agent-session artifacts and passes the ZKA route to
@@ -715,9 +904,10 @@ Each token is an RS256 compact JWS with `kid` bound to the enrolled key:
 }
 ```
 
-`iat` is backdated 30 seconds for clock skew and `exp` is exactly `iat + 300`, so
-the usable window after signing is about 270 seconds. Five minutes is hard-coded,
-not a setting. The API accepts no custom claims, audiences, scopes, digests, raw
+`iat` is backdated 30 seconds for clock skew and `exp` is exactly `iat` plus the
+alias's `assertion_lifetime_s`, so the usable window after signing is that
+lifetime less 30 seconds — about 270 seconds at the default 300. The ceiling of
+3600 seconds is enforced at claim construction, below every configuration path. The API accepts no custom claims, audiences, scopes, digests, raw
 bytes, or arbitrary service-account addresses — it selects among configured values
 and can introduce nothing new.
 
@@ -817,7 +1007,10 @@ while valid host clients keep working.
   or signature. Card
   selection, serial lookup, the live-certificate check, cross-key PIN verification,
   and signing all happen inside that one session. Status uses cached memory only
-  and never opens a card.
+  and never opens a card. While the daemon holds an assertion it also enumerates
+  reader *names* every two seconds and before serving any cache hit, so a removed
+  or swapped card closes the window on its own; that enumeration opens no card
+  session and stops as soon as nothing is held.
 - The certificate is read from slot `9c` **in the session that will sign**, its key
   ID is derived, and it must equal the configured `keys.<serial>.jwk_kid`. A
   replaced key on a known serial fails closed until it is deliberately re-enrolled.
@@ -878,9 +1071,17 @@ while valid host clients keep working.
   hardware window, so recovery cannot make that retry unreachable or emit a prompt
   with essentially no time left. Describe and unlock retain a two-second
   lease-acquisition budget.
-- The assertion is never cached, written to disk, or logged. Daemon logs record
-  alias, target, serial, key ID, and expiry — never a PIN, subject token, STS
-  token, access token, Google ID token, or Authorization header.
+- An assertion is never written to disk and never logged. It may be held in
+  daemon memory, and only where the operator's own policy says so: while a
+  byte-identical request is queued behind the signature it shares, and for the
+  span `assertion_reuse_s` and any granted authorisation window allow. Held
+  assertions are zeroized on every [purge
+  path](#every-path-that-drops-a-held-assertion) and never survive a restart.
+  Daemon logs record alias, target, serial, key ID, expiry, and the requesting
+  peer's PID and best-effort parent chain — never a PIN, subject token, STS
+  token, access token, Google ID token, or Authorization header. The peer chain
+  is journal context for finding a pathological caller, never an authorization
+  input: PIDs are reused and `comm` is whatever the process called itself.
 - The cached PIN is held as a byte slice and zeroized on lock, on a failed
   cross-card verification, and after each mint under `pin_cache = "never"`. Go
   cannot reliably erase the string copies the PIN makes crossing API and signer
@@ -1034,6 +1235,33 @@ a trusted host client can successfully authenticate:
 12. A daemon restart either reconnects on a later request or yields the structured
     `PIVB_UNAVAILABLE` response; it never widens or falls back. Run all tests for
     fresh, resumed, nested-tool, and alternate launchers for both agent products.
+
+#### Touch-free reuse and windows
+
+Run these only on a deployment that configures `assertion_reuse_s` or
+`max_grant_window_s` above zero, on real hardware with `--touch-policy ALWAYS`.
+Nothing below can be settled by a unit test: (a) and (b) measure physical
+touches, and (e) measures Google's behaviour rather than this daemon's.
+
+a. A scripted burst of **20** identical requests inside one open window requires
+   exactly **one** touch. Count touches physically; `pivb status` should show
+   `mints.total_60m` at 20 against `signatures_60m` at 1.
+b. A request issued after the window has closed prompts again. Expiry is a
+   state, not an error: it costs a touch, never a refusal.
+c. The touch prompt names the alias and target, the touch-free span it is
+   authorising, and — when the alias sets a non-default `assertion_lifetime_s` —
+   the assertion validity as well. Read the prompt; that is what it is for.
+d. `pivb lock` and unplugging the YubiKey each close every open window: the next
+   request prompts. Unplugging must take effect within the 2-second reader poll,
+   without waiting for a request.
+e. A live, permitted `gcloud` call succeeds on a cache-hit assertion. This is the
+   one step that verifies the STS replay assumption against the real provider
+   rather than assuming it; if it fails, set `assertion_reuse_s = 0` fleet-wide
+   and report it.
+f. Releasing the claim on the ZKA side purges immediately: `zka workspace
+   credentials release` is followed by `PIVB reuse invalidated workspace=…
+   purged=…` in zkad's journal, and the next mint through that workspace
+   prompts.
 
 ### Interim operating rule
 

@@ -53,8 +53,10 @@ func TestCredentialFileGolden(t *testing.T) {
 		t.Errorf("credential file does not end with a newline")
 	}
 
-	// output_file would make the auth library cache subject tokens on disk;
-	// pivb deliberately omits it so every request re-authorizes.
+	// output_file would put a bearer assertion on disk in the client's cache,
+	// which pivb prohibits outright. Touch-free reuse exists, but it lives in
+	// pivbd's memory under the operator's stated policy, where it is bounded
+	// and purgeable — not in a cache the daemon can neither see nor retire.
 	if strings.Contains(string(raw), "output_file") {
 		t.Errorf("credential file mentions output_file:\n%s", raw)
 	}

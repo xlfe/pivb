@@ -11,7 +11,7 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          version = "0.4.1";
+          version = "0.5.0";
           source = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
