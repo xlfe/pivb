@@ -12,6 +12,7 @@ import (
 	"github.com/xlfe/pivb/internal/forwardapi"
 	"github.com/xlfe/pivb/internal/pivsigner"
 	"github.com/xlfe/pivb/internal/tokenapi"
+	"github.com/xlfe/pivb/internal/uds"
 )
 
 type forwardBackend struct {
@@ -48,13 +49,20 @@ func (b forwardBackend) Mint(ctx context.Context, req forwardapi.MintRequest) (f
 	if err != nil {
 		return forwardapi.MintResponse{}, mapForwardError(err)
 	}
-	b.logger.Info("minted forwarded WIF subject token",
+	attrs := []any{
 		"alias", req.Alias, "target", req.ImpersonatedEmail,
 		"source_label", req.RequestSource.Label, "session_id", req.RequestSource.SessionID,
 		"origin_node", fc.OriginNodeID, "workspace", fc.WorkspaceID, "bundle", fc.Bundle,
 		"claim_generation", fc.ClaimGeneration, "provider_attachment_id", fc.ProviderAttachID,
 		"operation_id", fc.OperationID,
-		"serial", result.Serial, "key_id", result.KeyID)
+		"serial", result.Serial, "key_id", result.KeyID,
+	}
+	// The peer on this socket is the local zka daemon relaying the request,
+	// not the agent that started it; the ZKA context above names that.
+	if peer, ok := uds.PeerFromContext(ctx); ok {
+		attrs = append(attrs, "peer_pid", peer.PID)
+	}
+	b.logger.Info("minted forwarded WIF subject token", attrs...)
 	return forwardapi.MintResponse{
 		Version: forwardapi.ProtocolVersion, IDToken: result.IDToken, ExpirationTime: result.ExpiresAt.Unix(),
 		Card:           forwardapi.CardIdentity{Serial: result.Serial, KeyID: result.KeyID, SPKIDER: result.SPKIDER},

@@ -155,7 +155,8 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 		signer.Lease = cardlease.Client{Socket: cardLeaseSocket}
 	}
 	daemonCore := core.New(cfg, signer, version.Value)
-	control := &agentapi.API{Core: daemonCore}
+	daemonCore.SetLogger(logger)
+	control := &agentapi.API{Core: daemonCore, Logger: logger}
 	signing := &wifapi.API{Core: daemonCore, Logger: logger}
 	forwarding := &forwardapi.API{Backend: forwardBackend{core: daemonCore, logger: logger}}
 
@@ -169,10 +170,10 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 		serverCount++
 	}
 	errCh := make(chan error, serverCount)
-	go func() { errCh <- uds.Serve(ctx, controlSocket, control.Handler()) }()
-	go func() { errCh <- uds.Serve(ctx, wifSocket, signing.Handler()) }()
+	go func() { errCh <- uds.Serve(ctx, controlSocket, control.Handler(), uds.WithLogger(logger)) }()
+	go func() { errCh <- uds.Serve(ctx, wifSocket, signing.Handler(), uds.WithLogger(logger)) }()
 	if forwardSocket != "" {
-		go func() { errCh <- uds.Serve(ctx, forwardSocket, forwarding.Handler()) }()
+		go func() { errCh <- uds.Serve(ctx, forwardSocket, forwarding.Handler(), uds.WithLogger(logger)) }()
 	}
 	logger.Info("pivb serving",
 		"control_socket", controlSocket,

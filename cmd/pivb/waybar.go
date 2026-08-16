@@ -150,6 +150,9 @@ func formatWaybarStatus(status core.Status, statusErr error, now time.Time) wayb
 	} else {
 		lines = append(lines, "No mints since unlock")
 	}
+	if status.Mints != nil {
+		lines = append(lines, fmt.Sprintf("Mints: %d/1m %d/5m %d/60m", status.Mints.Total1m, status.Mints.Total5m, status.Mints.Total60m))
+	}
 	if status.WIFProvider != "" {
 		lines = append(lines, "Provider: "+status.WIFProvider)
 	}

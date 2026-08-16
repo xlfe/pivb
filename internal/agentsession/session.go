@@ -241,9 +241,13 @@ func Run(opts Options) error {
 	}
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
 	relayDone := make(chan error, 1)
-	serveRelay := uds.ServeListenerCancelRequests
-	if opts.ServeRelay != nil {
-		serveRelay = opts.ServeRelay
+	// The seam takes no uds options: the relay serves one delegated socket and
+	// has no logger of its own to give it.
+	serveRelay := opts.ServeRelay
+	if serveRelay == nil {
+		serveRelay = func(ctx context.Context, ln *uds.Listener, handler http.Handler) error {
+			return uds.ServeListenerCancelRequests(ctx, ln, handler)
+		}
 	}
 	go func() {
 		defer listener.Close()

@@ -16,11 +16,18 @@ import (
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/jsonhttp"
 	"github.com/xlfe/pivb/internal/pivsigner"
+	"github.com/xlfe/pivb/internal/procinfo"
 	"github.com/xlfe/pivb/internal/tokenapi"
+	"github.com/xlfe/pivb/internal/uds"
 )
 
 // maxRequestBody bounds the fixed-shape signing request.
 const maxRequestBody = 4 << 10
+
+// peerChainDepth is how far back a logged mint names its caller's ancestry:
+// far enough to reach the shell or agent behind a wrapper, short enough to
+// stay one readable journal attribute.
+const peerChainDepth = 5
 
 // Re-export the stable protocol types for compatibility with existing clients.
 const (
@@ -97,7 +104,7 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 		RouteSocket:             req.RouteSocket,
 	})
 	if err != nil {
-		a.writeCoreError(w, req.Alias, source, err)
+		a.writeCoreError(w, r, req.Alias, source, err)
 		return
 	}
 	source, _, _ = agentsource.Validate(source, req.Alias)
@@ -109,17 +116,18 @@ func (a *API) subjectToken(w http.ResponseWriter, r *http.Request) {
 	if source.Kind == agentsource.KindAgentSession {
 		attrs = append(attrs, "source_label", source.Label, "session_id", source.SessionID)
 	}
-	a.logger().Info("minted WIF subject token", attrs...)
+	a.logger().Info("minted WIF subject token", append(attrs, peerAttrs(r.Context())...)...)
 	jsonhttp.Write(w, http.StatusOK, SubjectTokenResponse{IDToken: result.IDToken, ExpirationTime: result.ExpiresAt.Unix()})
 }
 
-func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentsource.Source, err error) {
+func (a *API) writeCoreError(w http.ResponseWriter, r *http.Request, alias string, source agentsource.Source, err error) {
 	var unknownAlias *core.UnknownAliasError
 	var mismatch *core.RequestMismatchError
 	var invalidSource *core.RequestSourceError
 	var policyErr *attachment.PolicyError
 	var pinErr *pivsigner.PINError
 	var upstreamErr *tokenapi.APIError
+	peer := peerAttrs(r.Context())
 	attrs := []any{"alias", alias}
 	if normalized, _, sourceErr := agentsource.Validate(source, alias); sourceErr == nil {
 		attrs = append(attrs, "source_kind", normalized.Kind)
@@ -127,6 +135,7 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 			attrs = append(attrs, "source_label", normalized.Label, "session_id", normalized.SessionID)
 		}
 	}
+	attrs = append(attrs, peer...)
 	switch {
 	case errors.As(err, &policyErr):
 		a.logger().Warn("subject-token request violates attachment policy", append(attrs, "error", policyErr.Message)...)
@@ -147,7 +156,7 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 		a.logger().Warn("subject-token request while locked", attrs...)
 		writeError(w, http.StatusConflict, err.Error(), CodeLocked, "run `pivb unlock` on the trusted host")
 	case errors.As(err, &invalidSource):
-		a.logger().Warn("subject-token request has invalid source context", "alias", alias, "error", err)
+		a.logger().Warn("subject-token request has invalid source context", append([]any{"alias", alias, "error", err}, peer...)...)
 		writeError(w, http.StatusBadRequest, err.Error(), CodeConfig, "send a valid trusted-host request source")
 	case errors.As(err, &unknownAlias):
 		a.logger().Warn("subject-token request for unknown alias", attrs...)
@@ -171,6 +180,20 @@ func (a *API) writeCoreError(w http.ResponseWriter, alias string, source agentso
 		a.logger().Warn("subject-token signing failed", append(attrs, "error", err)...)
 		writeError(w, http.StatusBadGateway, err.Error(), CodeSign, "touch the YubiKey when prompted, check the daemon journal, then retry")
 	}
+}
+
+// peerAttrs names the process behind a request, and the ancestry behind that
+// process, so a journal line answers "who asked" and not only "what was
+// signed". It is called only after the mint outcome is decided: reading /proc
+// can therefore never delay, block, or fail a signature. The chain is one
+// attribute value because comm is process-controlled text and the log handler
+// must stay free to quote it.
+func peerAttrs(ctx context.Context) []any {
+	info, ok := uds.PeerFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return []any{"peer_pid", info.PID, "peer_chain", procinfo.FormatChain(procinfo.Chain("", info.PID, peerChainDepth))}
 }
 
 func routeKind(ctx attachment.Context) string {

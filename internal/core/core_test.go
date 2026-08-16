@@ -13,10 +13,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -801,6 +804,154 @@ func TestStatusIsCardFree(t *testing.T) {
 	}
 	if signer.counts != (signerCounts{}) {
 		t.Errorf("Status did card work: %+v", signer.counts)
+	}
+	if status := c.Status(); status.Mints != nil {
+		t.Errorf("a fresh status reported mint counters %+v, want none", status.Mints)
+	}
+}
+
+// movingClock is the counterpart to fixClock: the rolling mint window only
+// means anything if a test can place mints at different instants.
+type movingClock struct{ at time.Time }
+
+func (c *movingClock) now() time.Time          { return c.at }
+func (c *movingClock) advance(d time.Duration) { c.at = c.at.Add(d) }
+
+func startClock(c *Core) *movingClock {
+	clock := &movingClock{at: time.Unix(testNowUnix, 0).UTC()}
+	c.SetNowForTest(clock.now)
+	return clock
+}
+
+// agentRequest attaches the trusted-host session context that makes a mint
+// attributable to one agent session.
+func agentRequest(req SubjectTokenRequest, label, sessionID string) SubjectTokenRequest {
+	req.RequestSource = agentsource.Agent(label, sessionID)
+	return req
+}
+
+func TestStatusMintCounters(t *testing.T) {
+	sessionA := strings.Repeat("a", agentsource.SessionIDLength)
+	sessionB := strings.Repeat("b", agentsource.SessionIDLength)
+	c, signer := newTestCore(t, testConfig("session"), serialA)
+	clock := startClock(c)
+	unlockOK(t, c, pinA)
+
+	mintOK(t, c, agentRequest(roRequest(), "codex:proj/ro", sessionA))
+	clock.advance(2 * time.Minute)
+	mintOK(t, c, agentRequest(deployRequest(), "codex:proj/deploy", sessionB))
+	clock.advance(20 * time.Minute)
+	mintOK(t, c, agentRequest(roRequest(), "codex:proj/ro", sessionA))
+
+	counters := c.Status().Mints
+	if counters == nil {
+		t.Fatal("Status reported no mint counters after three mints")
+	}
+	if counters.Total1m != 1 || counters.Total5m != 1 || counters.Total60m != 3 {
+		t.Errorf("totals = %d/1m %d/5m %d/60m, want 1/1 1/5 3/60", counters.Total1m, counters.Total5m, counters.Total60m)
+	}
+	// Nothing is reused yet, so every mint in the window spent a touch.
+	if counters.Signatures60m != 3 {
+		t.Errorf("Signatures60m = %d, want 3", counters.Signatures60m)
+	}
+	if want := map[string]int{"ro": 2, "deploy": 1}; !reflect.DeepEqual(counters.PerAlias60m, want) {
+		t.Errorf("PerAlias60m = %v, want %v", counters.PerAlias60m, want)
+	}
+	if want := map[string]int{sessionA: 2, sessionB: 1}; !reflect.DeepEqual(counters.PerSession60m, want) {
+		t.Errorf("PerSession60m = %v, want %v", counters.PerSession60m, want)
+	}
+	if signer.counts.signatures != 3 {
+		t.Errorf("signer signed %d times, want 3", signer.counts.signatures)
+	}
+
+	// The window is pruned when a mint appends, so the two oldest entries and
+	// the alias and session only they carried drop out of the next report.
+	clock.advance(45 * time.Minute)
+	mintOK(t, c, agentRequest(roRequest(), "codex:proj/ro", sessionA))
+
+	counters = c.Status().Mints
+	if counters == nil {
+		t.Fatal("Status reported no mint counters after the pruning mint")
+	}
+	if counters.Total60m != 2 || counters.Total1m != 1 {
+		t.Errorf("totals after pruning = %d/1m %d/60m, want 1/1m 2/60m", counters.Total1m, counters.Total60m)
+	}
+	if want := map[string]int{"ro": 2}; !reflect.DeepEqual(counters.PerAlias60m, want) {
+		t.Errorf("PerAlias60m after pruning = %v, want %v", counters.PerAlias60m, want)
+	}
+	if want := map[string]int{sessionA: 2}; !reflect.DeepEqual(counters.PerSession60m, want) {
+		t.Errorf("PerSession60m after pruning = %v, want %v", counters.PerSession60m, want)
+	}
+}
+
+// TestLocalMintCountersOmitSession pins what a plain local-wif mint reports: a
+// total, an alias, and no session it never had.
+func TestLocalMintCountersOmitSession(t *testing.T) {
+	c, _ := newTestCore(t, testConfig("session"), serialA)
+	startClock(c)
+	unlockOK(t, c, pinA)
+	mintOK(t, c, roRequest())
+
+	counters := c.Status().Mints
+	if counters == nil {
+		t.Fatal("Status reported no mint counters after a local mint")
+	}
+	if counters.Total1m != 1 || counters.Total60m != 1 {
+		t.Errorf("totals = %d/1m %d/60m, want 1/1m 1/60m", counters.Total1m, counters.Total60m)
+	}
+	if want := map[string]int{"ro": 1}; !reflect.DeepEqual(counters.PerAlias60m, want) {
+		t.Errorf("PerAlias60m = %v, want %v", counters.PerAlias60m, want)
+	}
+	if counters.PerSession60m != nil {
+		t.Errorf("PerSession60m = %v, want nothing for a local-wif mint", counters.PerSession60m)
+	}
+}
+
+// TestMintRateWarnFiresOncePerWindow keeps the threshold warning honest in both
+// directions: a busy session is reported once, not once per mint, and a session
+// that stays busy into the next window is reported again.
+func TestMintRateWarnFiresOncePerWindow(t *testing.T) {
+	const warning = "session mint rate exceeds threshold"
+	session := strings.Repeat("a", agentsource.SessionIDLength)
+	c, _ := newTestCore(t, testConfig("session"), serialA)
+	clock := startClock(c)
+	var journal bytes.Buffer
+	c.SetLogger(slog.New(slog.NewTextHandler(&journal, nil)))
+	unlockOK(t, c, pinA)
+
+	req := agentRequest(roRequest(), "codex:proj/ro", session)
+	burst := func() {
+		t.Helper()
+		for range mintWarnThreshold {
+			clock.advance(time.Second)
+			mintOK(t, c, req)
+		}
+	}
+
+	burst()
+	if got := strings.Count(journal.String(), warning); got != 1 {
+		t.Fatalf("%d mints produced %d warnings, want exactly 1:\n%s", mintWarnThreshold, got, journal.String())
+	}
+	logged := journal.String()
+	for _, want := range []string{"level=WARN", "session_id=" + session, "alias=ro", "mints_5m=" + strconv.Itoa(mintWarnThreshold)} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("warning is missing %q: %s", want, logged)
+		}
+	}
+
+	// Still inside the same window: the session stays over the threshold and
+	// stays quiet.
+	burst()
+	if got := strings.Count(journal.String(), warning); got != 1 {
+		t.Fatalf("a continuing burst produced %d warnings, want the first one only:\n%s", got, journal.String())
+	}
+
+	// Past the window, with the earlier mints aged out of the five-minute
+	// count: a session that is still this busy is worth saying again.
+	clock.advance(mintWarnWindow + time.Minute)
+	burst()
+	if got := strings.Count(journal.String(), warning); got != 2 {
+		t.Fatalf("a burst in the next window produced %d warnings in total, want 2:\n%s", got, journal.String())
 	}
 }
 

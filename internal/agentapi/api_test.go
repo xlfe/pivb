@@ -1,15 +1,20 @@
 package agentapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,12 +69,18 @@ func testConfig() *config.Config {
 	}
 }
 
+// quietLogger keeps the control API's own records out of the test log without
+// giving up the assertion that they were written.
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+}
+
 func newTestAPI(t *testing.T) *API {
 	t.Helper()
 	if err := testConfig().Validate(); err != nil {
 		t.Fatalf("test config is invalid, fix the fixture: %v", err)
 	}
-	return &API{Core: core.New(testConfig(), fakeSigner{}, "test-version")}
+	return &API{Core: core.New(testConfig(), fakeSigner{}, "test-version"), Logger: quietLogger()}
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -249,7 +260,7 @@ func TestUnlockWrongPIN(t *testing.T) {
 }
 
 func TestUnlockContentionHasBusyRemedyAndStableCode(t *testing.T) {
-	api := &API{Core: core.New(testConfig(), busySigner{}, "test-version")}
+	api := &API{Core: core.New(testConfig(), busySigner{}, "test-version"), Logger: quietLogger()}
 	rec := do(t, api.Handler(), http.MethodPost, "/v1/unlock", `{"pin":"123456"}`)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (body %q)", rec.Code, rec.Body.String())
@@ -323,9 +334,11 @@ func TestUnlockOversizedBody(t *testing.T) {
 	}
 }
 
-func TestClientRoundTrip(t *testing.T) {
+// serveAPI puts the control API on a real uds listener, the only transport
+// that carries peer credentials.
+func serveAPI(t *testing.T, api *API) string {
+	t.Helper()
 	socket := filepath.Join(t.TempDir(), "s.sock")
-	api := newTestAPI(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- uds.Serve(ctx, socket, api.Handler()) }()
@@ -341,6 +354,11 @@ func TestClientRoundTrip(t *testing.T) {
 		}
 	})
 	waitReady(t, socket)
+	return socket
+}
+
+func TestClientRoundTrip(t *testing.T) {
+	socket := serveAPI(t, newTestAPI(t))
 
 	client := NewClient(socket)
 	reqCtx := context.Background()
@@ -408,6 +426,69 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(httpErr.Error(), "PIVB_PIN") {
 		t.Errorf("HTTPError.Error() = %q, want it to mention the stable code", httpErr.Error())
+	}
+}
+
+// syncBuffer collects journal lines a handler goroutine writes while the test
+// goroutine reads them.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestControlLogNamesPeerWithoutPIN checks both halves of the control-socket
+// record: every state change is attributed to the process that asked for it,
+// and none of them writes the PIN or the card's remaining attempts.
+func TestControlLogNamesPeerWithoutPIN(t *testing.T) {
+	journal := &syncBuffer{}
+	api := newTestAPI(t)
+	api.Logger = slog.New(slog.NewTextHandler(journal, nil))
+	client := NewClient(serveAPI(t, api))
+	ctx := context.Background()
+
+	if _, err := client.Unlock(ctx, "000000"); err == nil {
+		t.Fatal("Unlock with a wrong PIN = nil error, want a rejection")
+	}
+	if _, err := client.Unlock(ctx, testPIN); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if err := client.Lock(ctx); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	logged := journal.String()
+	peer := fmt.Sprintf("peer_pid=%d", os.Getpid())
+	for _, want := range []string{
+		"level=WARN msg=\"unlock failed\"",
+		fmt.Sprintf("level=INFO msg=unlocked serial=%d %s", testSerial, peer),
+		"msg=\"locked; cached PIN and signing metadata discarded\" " + peer,
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("journal is missing %q:\n%s", want, logged)
+		}
+	}
+	if got := strings.Count(logged, peer); got != 3 {
+		t.Errorf("%q appears %d times, want one per request:\n%s", peer, got, logged)
+	}
+	// The rejected PIN never reaches the journal, and neither does a retry
+	// countdown of its own: the caller's 403 body is the only place the card's
+	// remaining attempts are reported.
+	for _, forbidden := range []string{"000000", "pin=", "retries="} {
+		if strings.Contains(logged, forbidden) {
+			t.Errorf("journal contains %q, which the control API must never record:\n%s", forbidden, logged)
+		}
 	}
 }
 

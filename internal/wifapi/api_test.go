@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -409,6 +411,76 @@ func TestAgentSourceLoggedWithoutToken(t *testing.T) {
 	}
 	if strings.Contains(logged, testToken) {
 		t.Fatalf("agent log contains token: %s", logged)
+	}
+}
+
+// syncBuffer collects journal lines a handler goroutine writes while the test
+// goroutine reads them.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestMintLogCarriesPeerPID exercises attribution over a real uds listener, the
+// only place SO_PEERCRED exists: whether the mint succeeds or is refused, the
+// journal names the process that asked, and still never names the token.
+func TestMintLogCarriesPeerPID(t *testing.T) {
+	tests := []struct {
+		name      string
+		core      Core
+		wantMsg   string
+		wantError bool
+	}{
+		{name: "success", core: okCore(), wantMsg: "minted WIF subject token"},
+		{name: "refusal", core: failingCore(core.ErrLocked), wantMsg: "subject-token request while locked", wantError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := &syncBuffer{}
+			api := &API{Core: tc.core, Logger: slog.New(slog.NewTextHandler(journal, nil))}
+			socket := serveOnSocket(t, api.Handler())
+
+			_, err := NewClient(socket).SubjectToken(context.Background(), SubjectTokenRequest{
+				Alias:                   "ro",
+				ExternalAccountAudience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pivb-pool/providers/pivb-provider",
+				ImpersonatedEmail:       "readonly-sa@example-project-id.iam.gserviceaccount.com",
+			})
+			if tc.wantError && err == nil {
+				t.Fatal("SubjectToken = nil error, want the core rejection")
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("SubjectToken: %v", err)
+			}
+
+			logged := journal.String()
+			if !strings.Contains(logged, tc.wantMsg) {
+				t.Fatalf("journal is missing %q: %s", tc.wantMsg, logged)
+			}
+			if want := fmt.Sprintf("peer_pid=%d", os.Getpid()); !strings.Contains(logged, want) {
+				t.Errorf("journal is missing %q: %s", want, logged)
+			}
+			if !strings.Contains(logged, "peer_chain=") {
+				t.Errorf("journal is missing peer_chain: %s", logged)
+			}
+			if want := fmt.Sprintf("%d(", os.Getpid()); !strings.Contains(logged, want) {
+				t.Errorf("peer chain does not start at this process (%q): %s", want, logged)
+			}
+			if strings.Contains(logged, testToken) {
+				t.Errorf("journal contains the minted token %q: %s", testToken, logged)
+			}
+		})
 	}
 }
 

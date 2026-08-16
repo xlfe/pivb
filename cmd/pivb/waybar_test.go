@@ -76,6 +76,11 @@ func TestFormatWaybarStatus(t *testing.T) {
 	forwarded.LastSignForward = &forwardapi.ForwardContext{
 		ProviderNodeID: strings.Repeat("a", 32), WorkspaceID: strings.Repeat("b", 32), Bundle: "work",
 	}
+	counted := signed
+	counted.Mints = &core.MintCounters{
+		Total1m: 2, Total5m: 7, Total60m: 41, Signatures60m: 41,
+		PerAlias60m: map[string]int{"ro": 41},
+	}
 
 	tests := []struct {
 		name        string
@@ -83,6 +88,7 @@ func TestFormatWaybarStatus(t *testing.T) {
 		err         error
 		wantClass   string
 		wantTooltip []string
+		notTooltip  []string
 	}{
 		{
 			name:        "unavailable",
@@ -104,6 +110,8 @@ func TestFormatWaybarStatus(t *testing.T) {
 				"PIN cached \u00b7 key 12345678",
 				"No mints since unlock",
 			},
+			// A daemon that has minted nothing reports no rate at all.
+			notTooltip: []string{"Mints:"},
 		},
 		{
 			name:      "ready after a mint",
@@ -113,6 +121,15 @@ func TestFormatWaybarStatus(t *testing.T) {
 				"Last mint: ro \u2192 " + testTargetRO,
 				"Signed 5m ago by key 12345678",
 				"Provider: " + testProviderResource,
+			},
+		},
+		{
+			name:      "ready with a mint rate",
+			status:    counted,
+			wantClass: "ready",
+			wantTooltip: []string{
+				"Last mint: ro → " + testTargetRO,
+				"Mints: 2/1m 7/5m 41/60m",
 			},
 		},
 		{
@@ -139,6 +156,11 @@ func TestFormatWaybarStatus(t *testing.T) {
 			for _, want := range tt.wantTooltip {
 				if !strings.Contains(got.Tooltip, want) {
 					t.Errorf("tooltip does not contain %q:\n%s", want, got.Tooltip)
+				}
+			}
+			for _, unwanted := range tt.notTooltip {
+				if strings.Contains(got.Tooltip, unwanted) {
+					t.Errorf("tooltip contains %q, want it omitted:\n%s", unwanted, got.Tooltip)
 				}
 			}
 		})

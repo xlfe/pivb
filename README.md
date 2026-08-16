@@ -545,7 +545,9 @@ $ pivb status
 After a signature it also reports `last_sign_alias`, `last_sign_target`,
 `last_sign_serial`, `last_sign_key_id`, and `last_sign_at`. `pin_verified_serial`
 is the key the cached PIN was verified against; `last_sign_serial` is the key that
-last signed.
+last signed. `mints` carries the rolling in-memory mint rate — `total_1m`,
+`total_5m`, `total_60m`, `signatures_60m`, and per-alias and per-session counts
+for the last hour — and is omitted entirely when nothing was minted in that hour.
 
 `--format waybar` emits a `text`/`tooltip`/`class`/`alt` object with class `ready`,
 `locked`, or `unavailable`, and exits **0** even when the daemon is down so the bar

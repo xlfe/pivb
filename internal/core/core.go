@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
@@ -90,6 +91,45 @@ type SignEvent struct {
 	ForwardContext forwardapi.ForwardContext
 }
 
+// mintRecord is one completed mint, kept in memory only for rate reporting.
+// It holds no token material: an alias and a session identifier that
+// configuration and agentsource.Validate have already bound, and nothing else.
+type mintRecord struct {
+	at        time.Time
+	alias     string
+	sessionID string
+	// reused marks a mint served without a fresh signature; forwarded marks
+	// one satisfied over a ZKA route rather than by the local card.
+	reused    bool
+	forwarded bool
+}
+
+const (
+	// mintRingWindow is how far back the rolling counters can see, and
+	// mintRingCap bounds the ring so an unexpectedly busy hour cannot grow it
+	// without limit. Both are memory-only: no mint is ever refused for them.
+	mintRingWindow = time.Hour
+	mintRingCap    = 4096
+	// A session that crosses mintWarnThreshold mints within mintWarnWindow
+	// earns one journal warning per window. This is visibility, not policy:
+	// every one of those mints still required a physical touch.
+	mintWarnThreshold = 30
+	mintWarnWindow    = 5 * time.Minute
+)
+
+// MintCounters is the rolling in-memory mint rate. Reporting it touches no
+// card and reveals no token material.
+type MintCounters struct {
+	Total1m  int `json:"total_1m"`
+	Total5m  int `json:"total_5m"`
+	Total60m int `json:"total_60m"`
+	// Signatures60m counts the mints that spent a touch rather than reusing an
+	// assertion. It equals Total60m until a reuse cache exists.
+	Signatures60m int            `json:"signatures_60m"`
+	PerAlias60m   map[string]int `json:"per_alias_60m,omitempty"`
+	PerSession60m map[string]int `json:"per_session_60m,omitempty"`
+}
+
 type Status struct {
 	PINCached         bool                       `json:"pin_cached"`
 	PINVerifiedSerial uint32                     `json:"pin_verified_serial"`
@@ -101,6 +141,7 @@ type Status struct {
 	LastSignAt        time.Time                  `json:"last_sign_at,omitzero"`
 	LastSignRoute     string                     `json:"last_sign_route,omitempty"`
 	LastSignForward   *forwardapi.ForwardContext `json:"last_sign_forward_context,omitempty"`
+	Mints             *MintCounters              `json:"mints,omitempty"`
 	Version           string                     `json:"version"`
 }
 
@@ -117,6 +158,11 @@ type Core struct {
 	pin               []byte
 	pinVerifiedSerial uint32
 	lastSign          *SignEvent
+	logger            *slog.Logger
+	// mintRing is the rolling mint window, pruned only when a mint appends;
+	// warnedAt records when each session last triggered a rate warning.
+	mintRing []mintRecord
+	warnedAt map[string]time.Time
 }
 
 func New(cfg *config.Config, signer pivsigner.Signer, version string) *Core {
@@ -129,6 +175,14 @@ func New(cfg *config.Config, signer pivsigner.Signer, version string) *Core {
 
 func (c *Core) SetNowForTest(now func() time.Time) { c.now = now }
 func (c *Core) SetRandomForTest(random io.Reader)  { c.random = random }
+
+// SetLogger routes core's own observations — today, only the mint-rate
+// warning — to l. Without it they go to slog.Default().
+func (c *Core) SetLogger(l *slog.Logger) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.logger = l
+}
 
 func (c *Core) Unlock(ctx context.Context, pin string) (int, error) {
 	if pin == "" {
@@ -175,11 +229,13 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		if err != nil {
 			return SubjectTokenResult{}, err
 		}
+		at := c.now().UTC()
 		c.mu.Lock()
 		c.lastSign = &SignEvent{
 			Alias: req.Alias, Target: req.ImpersonatedEmail, Serial: result.Serial, KeyID: result.KeyID,
-			At: c.now().UTC(), Route: "zka-workspace-forwarded", ForwardContext: result.ForwardContext,
+			At: at, Route: "zka-workspace-forwarded", ForwardContext: result.ForwardContext,
 		}
+		c.recordMintLocked(mintRecord{at: at, alias: req.Alias, sessionID: req.RequestSource.SessionID, forwarded: true})
 		c.mu.Unlock()
 		return result, nil
 	}
@@ -285,6 +341,7 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 		route = "zka-workspace-provider"
 	}
 	c.lastSign = &SignEvent{Alias: req.Alias, Target: alias.Target, Serial: serial, KeyID: signedKid, At: now, Route: route, ForwardContext: req.ForwardContext}
+	c.recordMintLocked(mintRecord{at: now, alias: req.Alias, sessionID: req.RequestSource.SessionID})
 	c.mu.Unlock()
 	return SubjectTokenResult{IDToken: token, ExpiresAt: claims.ExpiresAt(), Serial: serial, KeyID: signedKid, SPKIDER: signedSPKI}, nil
 }
@@ -477,7 +534,107 @@ func (c *Core) Status() Status {
 			status.LastSignForward = &forward
 		}
 	}
+	status.Mints = c.mintCountersLocked()
 	return status
+}
+
+// recordMintLocked appends one completed mint to the rolling window and warns
+// when a single session's rate crosses the threshold. The caller holds c.mu.
+// It is bookkeeping only: the mint has already succeeded, and nothing here can
+// change that outcome or reach the card.
+func (c *Core) recordMintLocked(rec mintRecord) {
+	c.mintRing = append(c.mintRing, rec)
+	cutoff := rec.at.Add(-mintRingWindow)
+	kept := c.mintRing[:0]
+	for _, entry := range c.mintRing {
+		if entry.at.After(cutoff) {
+			kept = append(kept, entry)
+		}
+	}
+	c.mintRing = kept
+	if overflow := len(c.mintRing) - mintRingCap; overflow > 0 {
+		// Drop the oldest, compacting in place so the ring cannot creep
+		// forward through an ever-growing backing array.
+		c.mintRing = c.mintRing[:copy(c.mintRing, c.mintRing[overflow:])]
+	}
+	if rec.sessionID == "" {
+		return
+	}
+
+	since := rec.at.Add(-mintWarnWindow)
+	recent := 0
+	for _, entry := range c.mintRing {
+		if entry.sessionID == rec.sessionID && entry.at.After(since) {
+			recent++
+		}
+	}
+	// One line per window per session, so a busy agent cannot flood the
+	// journal with the evidence that it is busy.
+	if recent >= mintWarnThreshold && !c.warnedAt[rec.sessionID].After(since) {
+		c.loggerLocked().Warn("session mint rate exceeds threshold",
+			"session_id", rec.sessionID, "alias", rec.alias, "mints_5m", recent)
+		if c.warnedAt == nil {
+			c.warnedAt = make(map[string]time.Time)
+		}
+		c.warnedAt[rec.sessionID] = rec.at
+	}
+	for session, at := range c.warnedAt {
+		if !at.After(cutoff) {
+			delete(c.warnedAt, session)
+		}
+	}
+}
+
+// mintCountersLocked aggregates the rolling window without pruning it, so
+// Status keeps the read lock; pruning happens only when a mint appends. It
+// returns nil when nothing was minted in the window, leaving Status silent
+// about a rate rather than reporting a row of zeros.
+func (c *Core) mintCountersLocked() *MintCounters {
+	if len(c.mintRing) == 0 {
+		return nil
+	}
+	now := c.now().UTC()
+	counters := MintCounters{PerAlias60m: make(map[string]int), PerSession60m: make(map[string]int)}
+	for _, entry := range c.mintRing {
+		age := now.Sub(entry.at)
+		if age >= mintRingWindow {
+			continue
+		}
+		counters.Total60m++
+		if !entry.reused {
+			counters.Signatures60m++
+		}
+		if age < time.Minute {
+			counters.Total1m++
+		}
+		if age < 5*time.Minute {
+			counters.Total5m++
+		}
+		if entry.alias != "" {
+			counters.PerAlias60m[entry.alias]++
+		}
+		if entry.sessionID != "" {
+			counters.PerSession60m[entry.sessionID]++
+		}
+	}
+	if counters.Total60m == 0 {
+		return nil
+	}
+	if len(counters.PerAlias60m) == 0 {
+		counters.PerAlias60m = nil
+	}
+	if len(counters.PerSession60m) == 0 {
+		counters.PerSession60m = nil
+	}
+	return &counters
+}
+
+// loggerLocked reads c.logger, so the caller holds c.mu.
+func (c *Core) loggerLocked() *slog.Logger {
+	if c.logger != nil {
+		return c.logger
+	}
+	return slog.Default()
 }
 
 func signingLabel(req SubjectTokenRequest, target string) string {

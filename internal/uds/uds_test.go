@@ -1,10 +1,12 @@
 package uds
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -79,7 +81,18 @@ func TestServeEndToEnd(t *testing.T) {
 	}
 	socket := filepath.Join(dir, "s.sock")
 
-	handle := startServe(t, socket, okHandler())
+	// The handler reports the peer it was told about, so this covers the whole
+	// path: SO_PEERCRED on accept, through the gate, out of the request context.
+	peers := make(chan PeerInfo, 1)
+	handle := startServe(t, socket, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, ok := PeerFromContext(r.Context())
+		if !ok {
+			t.Error("PeerFromContext = false inside a served handler")
+		}
+		peers <- peer
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "pong")
+	}))
 	waitReady(t, socket)
 
 	resp, err := NewHTTPClient(socket, 2*time.Second).Get("http://pivb/ping")
@@ -87,6 +100,17 @@ func TestServeEndToEnd(t *testing.T) {
 		t.Fatalf("same-UID request failed: %v", err)
 	}
 	defer resp.Body.Close()
+	select {
+	case peer := <-peers:
+		if peer.PID != int32(os.Getpid()) {
+			t.Errorf("handler saw peer PID %d, want this process (%d)", peer.PID, os.Getpid())
+		}
+		if peer.UID != uint32(os.Getuid()) {
+			t.Errorf("handler saw peer UID %d, want %d", peer.UID, os.Getuid())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never reported a peer")
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read body: %v", err)
@@ -323,6 +347,12 @@ func TestServeRefusesActiveSocket(t *testing.T) {
 	}
 }
 
+// quietLogger keeps the refusal record of an expected rejection out of the
+// test log without giving up the assertion that one was written.
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+}
+
 func TestRequirePeer(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -336,19 +366,19 @@ func TestRequirePeer(t *testing.T) {
 		{
 			name: "peer rejected",
 			setContext: func(r *http.Request) *http.Request {
-				return r.WithContext(context.WithValue(r.Context(), peerAllowedKey{}, false))
+				return r.WithContext(context.WithValue(r.Context(), peerKey{}, peerInfo{uid: 4242, pid: 99}))
 			},
 		},
 		{
 			name: "wrong value type",
 			setContext: func(r *http.Request) *http.Request {
-				return r.WithContext(context.WithValue(r.Context(), peerAllowedKey{}, "true"))
+				return r.WithContext(context.WithValue(r.Context(), peerKey{}, true))
 			},
 		},
 		{
 			name: "peer allowed",
 			setContext: func(r *http.Request) *http.Request {
-				return r.WithContext(context.WithValue(r.Context(), peerAllowedKey{}, true))
+				return r.WithContext(context.WithValue(r.Context(), peerKey{}, peerInfo{allowed: true, uid: 1000, pid: 99}))
 			},
 			wantNext: true,
 		},
@@ -359,7 +389,7 @@ func TestRequirePeer(t *testing.T) {
 			handler := requirePeer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				reached = true
 				w.WriteHeader(http.StatusTeapot)
-			}))
+			}), quietLogger())
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, tc.setContext(httptest.NewRequest(http.MethodGet, "/v1/status", nil)))
 
@@ -395,13 +425,53 @@ func TestRequirePeer(t *testing.T) {
 	}
 }
 
-func TestPeerUIDMatches(t *testing.T) {
+func TestPeerFromContext(t *testing.T) {
+	want := PeerInfo{UID: 1000, PID: 4242}
+	ctx := context.WithValue(context.Background(), peerKey{}, peerInfo{allowed: true, uid: want.UID, pid: want.PID})
+	got, ok := PeerFromContext(ctx)
+	if !ok {
+		t.Fatal("PeerFromContext(served context) reported no peer")
+	}
+	if got != want {
+		t.Errorf("PeerFromContext = %+v, want %+v", got, want)
+	}
+	if got, ok := PeerFromContext(context.Background()); ok {
+		t.Errorf("PeerFromContext(plain context) = %+v, true; want the zero peer and false", got)
+	}
+}
+
+func TestRequirePeerLogsRefusal(t *testing.T) {
+	var journal bytes.Buffer
+	handler := requirePeer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("a refused peer reached the wrapped handler")
+	}), slog.New(slog.NewTextHandler(&journal, nil)))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/subject-token", nil)
+	req = req.WithContext(context.WithValue(req.Context(), peerKey{}, peerInfo{uid: 4242, pid: 31337}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	logged := strings.TrimSuffix(journal.String(), "\n")
+	if lines := strings.Count(logged, "\n"); lines != 0 {
+		t.Errorf("one refusal produced %d log lines, want exactly one:\n%s", lines+1, logged)
+	}
+	for _, want := range []string{"level=WARN", "refused socket peer", "peer_uid=4242", "peer_pid=31337", "method=POST", "path=/v1/subject-token"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("refusal log is missing %q: %s", want, logged)
+		}
+	}
+}
+
+func TestPeerCredentials(t *testing.T) {
 	t.Run("non-unix conn", func(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()
 		defer server.Close()
-		if peerUIDMatches(client, uint32(os.Getuid())) {
-			t.Error("peerUIDMatches(net.Pipe conn) = true, want false: SO_PEERCRED is unavailable there")
+		if got := peerCredentials(client, uint32(os.Getuid())); got.allowed {
+			t.Errorf("peerCredentials(net.Pipe conn) = %+v, want a refusal: SO_PEERCRED is unavailable there", got)
 		}
 	})
 
@@ -434,11 +504,21 @@ func TestPeerUIDMatches(t *testing.T) {
 		defer conn.Close()
 
 		uid := uint32(os.Getuid())
-		if !peerUIDMatches(conn, uid) {
-			t.Errorf("peerUIDMatches(conn, %d) = false, want true for our own connection", uid)
+		got := peerCredentials(conn, uid)
+		if !got.allowed {
+			t.Errorf("peerCredentials(conn, %d) = %+v, want it allowed for our own connection", uid, got)
 		}
-		if peerUIDMatches(conn, uid+1) {
-			t.Errorf("peerUIDMatches(conn, %d) = true, want false for a different UID", uid+1)
+		if got.uid != uid || got.pid != int32(os.Getpid()) {
+			t.Errorf("peerCredentials(conn, %d) = %+v, want uid %d and pid %d", uid, got, uid, os.Getpid())
+		}
+		// A wrong UID is refused, but its identity is still recorded so the
+		// refusal can name the process that made it.
+		refused := peerCredentials(conn, uid+1)
+		if refused.allowed {
+			t.Errorf("peerCredentials(conn, %d) = %+v, want a refusal for a different UID", uid+1, refused)
+		}
+		if refused.uid != uid || refused.pid != int32(os.Getpid()) {
+			t.Errorf("refused peer = %+v, want it to still carry uid %d and pid %d", refused, uid, os.Getpid())
 		}
 	})
 }
