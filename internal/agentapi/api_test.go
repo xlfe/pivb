@@ -54,6 +54,7 @@ func testConfig() *config.Config {
 	return &config.Config{
 		PIVSlot:  "9c",
 		PINCache: "session",
+		Card:     config.CardLocal,
 		WIF: config.WIF{
 			ProjectNumber: "123456789012",
 			PoolID:        "pivb-pool",
@@ -274,6 +275,32 @@ func TestUnlockContentionHasBusyRemedyAndStableCode(t *testing.T) {
 	}
 	if strings.Contains(body.Remedy, "insert exactly one") || !strings.Contains(body.Remedy, "competing") {
 		t.Fatalf("remedy = %q, want contention guidance instead of card insertion", body.Remedy)
+	}
+}
+
+// TestUnlockOnCardFreeOrigin pins that a card-free daemon refuses unlock with
+// its own code and remedy — never the 503 "insert exactly one configured
+// YubiKey" fallback, whose instruction this host cannot follow.
+func TestUnlockOnCardFreeOrigin(t *testing.T) {
+	cfg := testConfig()
+	cfg.Card = config.CardNone
+	api := &API{Core: core.New(cfg, pivsigner.CardFree{}, "test-version"), Logger: quietLogger()}
+	rec := do(t, api.Handler(), http.MethodPost, "/v1/unlock", `{"pin":"123456"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body %q)", rec.Code, rec.Body.String())
+	}
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "PIVB_CARD_FREE" {
+		t.Fatalf("code = %q, want PIVB_CARD_FREE", body.Code)
+	}
+	if strings.Contains(body.Remedy, "insert exactly one") || !strings.Contains(body.Remedy, "provider host") {
+		t.Fatalf("remedy = %q, want the provider host instead of card insertion", body.Remedy)
+	}
+	if status := do(t, api.Handler(), http.MethodGet, "/v1/status", ""); !strings.Contains(status.Body.String(), `"card":"none"`) {
+		t.Fatalf("card-free status does not report its mode: %s", status.Body.String())
 	}
 }
 

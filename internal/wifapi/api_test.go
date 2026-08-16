@@ -235,6 +235,20 @@ func TestSubjectTokenErrorMapping(t *testing.T) {
 			wantRemedy: core.WindowNotAllowedRemedy,
 		},
 		{
+			name:       "card-free origin",
+			err:        &pivsigner.CardFreeError{Operation: "mint a locally signed subject token", Remedy: "run the workload in a ZKA route-required workspace"},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeCardFree,
+			wantRemedy: "run the workload in a ZKA route-required workspace",
+		},
+		{
+			name:       "card-free origin without remedy",
+			err:        fmt.Errorf("mint: %w", &pivsigner.CardFreeError{Operation: "verify a PIV PIN"}),
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeCardFree,
+			wantRemedy: pivsigner.CardFreeRemedy,
+		},
+		{
 			name:       "PIN failure",
 			err:        &pivsigner.PINError{Retries: 2, Err: errors.New("wrong"), Remedy: "run pivb unlock"},
 			wantStatus: http.StatusConflict,

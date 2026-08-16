@@ -123,6 +123,7 @@ Copy [`config.example.toml`](config.example.toml) to `~/.config/pivb/config.toml
 piv_slot = "9c"
 pin_cache = "session" # or "never": consume the cached PIN on each mint
 notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
+card = "local" # or "none": a card-free ZKA origin with no PC/SC at all
 max_grant_window_s = 0 # longest authorisation window granted to a ZKA claim
 gnupg_home = "/home/replace-me/.gnupg" # optional absolute custom home
 
@@ -155,8 +156,10 @@ identity-bearing value must match a conservative grammar before it can reach a
 signed claim or a generated Google artifact:
 
 - `piv_slot` must be `"9c"`; `pin_cache` must be `"session"` or `"never"`;
-  `gnupg_home`, when present, must be absolute but is checked for existence and
-  access only if card-contention recovery uses GnuPG.
+  `card` must be `"local"` or `"none"` (see [card-free
+  origins](#card-free-origins)); `gnupg_home`, when present, must be absolute
+  but is checked for existence and access only if card-contention recovery uses
+  GnuPG.
 - `wif.project_number` is the nonzero decimal **project number**, not the project ID.
 - `wif.pool_id` and `wif.provider_id` are 4–32 lowercase letters, digits, or
   hyphens, start with a letter, end with a letter or digit, and may not start with
@@ -670,10 +673,15 @@ $ pivb status
 {
   "pin_cached": false,
   "pin_verified_serial": 0,
+  "card": "local",
   "wif_provider": "projects/123456789012/locations/global/workloadIdentityPools/pivb/providers/yubikey-piv",
   "version": "dev"
 }
 ```
+
+`card` is the daemon's configured relationship to PIV hardware — `"local"` or
+`"none"` — so a [card-free origin](#card-free-origins) explains its refusals in
+its own status.
 
 After a signature it also reports `last_sign_alias`, `last_sign_target`,
 `last_sign_serial`, `last_sign_key_id`, and `last_sign_at`. `pin_verified_serial`
@@ -744,6 +752,7 @@ Stable codes (the code does not determine HTTP status by itself):
 | `PIVB_LOCKED` | 409 | no cached PIN; run `pivb unlock` on the trusted host |
 | `PIVB_PIN` | 409/403 | PIN rejected, or refusing to spend the final PIN retry |
 | `PIVB_WINDOW_NOT_ALLOWED` | 403 | a mint asked to be covered by an authorisation window this provider's `max_grant_window_s` does not grant — raise it, or re-claim without `--window` |
+| `PIVB_CARD_FREE` | 403 | the operation needs the local YubiKey but this daemon is configured `card = "none"` — perform it on the provider host, or route the workload through a ZKA workspace |
 | `PIVB_SIGN` | 502/503 | generic PIV/signing failure, or retryable card contention/insufficient touch window |
 | `PIVB_INTERNAL` | 500 | malformed daemon response or an unclassified daemon error |
 | `PIVB_PEER` | 403 | the socket peer's real UID is not the daemon's — surfaced from the UDS layer |
@@ -885,6 +894,39 @@ only the ordinary four agent-session artifacts and passes the ZKA route to
 `docs/pivb-credential-bundles.md` specifies claim, takeover, release, and
 stable-route behavior.
 
+### Card-free origins
+
+The receiving half of that route needs a local pivbd too — as the verifier and
+policy endpoint, not as a signer. A headless host whose only card operations
+arrive back through ZKA routes declares that with one key:
+
+```toml
+card = "none"
+```
+
+A card-free daemon starts and runs without pcscd, a reader, or a card: it
+never opens a PC/SC connection, never primes GnuPG recovery diagnostics, and
+never takes the cooperative card lease (the packaged unit's
+`--card-lease-socket` flag is accepted and unused). Everything the origin role
+uses is unchanged — route-required mints with full independent verification of
+the forwarded assertion, `GET /v1/policy`, `POST /v1/invalidate`, health,
+status, and lock. Everything that would need the card here — `unlock`,
+local-allowed mints, `GET /v1/describe`, `POST /v1/mint` — is refused with
+`PIVB_CARD_FREE` before any cached state is consulted, so a card-free origin
+answers "the card is on another host", never a `PIVB_LOCKED` its own unlock
+could not satisfy.
+
+The rest of the configuration is shared fleet state on both roles, by design:
+the origin verifies a forwarded assertion against its **own** `[wif]` provider,
+`[keys.*]` enrollment, and per-alias `target`/`assertion_lifetime_s`, so those
+tables must exist and match on the card host and the card-free host alike.
+Deploy one configuration and flip `card` per host; on card-free hosts, do not
+install or enable pcscd at all.
+
+`card = "local"` (the default) is exactly today's behaviour, including the
+fail-fast startup probe when pcscd is unreachable — where a card is expected,
+a broken card path should stop the daemon at startup, not at the first touch.
+
 ### Subject token
 
 Each token is an RS256 compact JWS with `kid` bound to the enrolled key:
@@ -926,7 +968,8 @@ The service runs in the **user** manager so `gpgconf --kill scdaemon`, `GNUPGHOM
 and desktop notifications resolve in the right session. At startup it verifies that
 pcscd is reachable; with `Restart=on-failure` it retries until the system
 smart-card service is available. No YubiKey needs to be inserted for the daemon to
-start.
+start. With `card = "none"` the same unit skips the probe entirely and needs no
+pcscd on the host — see [Card-free origins](#card-free-origins).
 
 The user manager does not read Fish startup files. If Fish exports a custom
 `GNUPGHOME`, either set the absolute `gnupg_home` in `config.toml`, or import it

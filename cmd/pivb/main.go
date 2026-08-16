@@ -146,13 +146,23 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 		return err
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := pivsigner.CheckPCSC(); err != nil {
-		return err
-	}
-	signer := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger, GnuPGHome: cfg.GnuPGHome}
-	signer.PrimeGnuPGDiagnostics()
-	if cardLeaseSocket != "" {
-		signer.Lease = cardlease.Client{Socket: cardLeaseSocket}
+	var signer pivsigner.Signer
+	if cfg.CardFree() {
+		// A card-free origin opens no PC/SC connection in its whole lifetime:
+		// no startup probe, no GnuPG recovery priming, no cooperative card
+		// lease. The packaged unit still passes --card-lease-socket; it is
+		// accepted and unused so one unit serves both roles.
+		signer = pivsigner.CardFree{}
+	} else {
+		if err := pivsigner.CheckPCSC(); err != nil {
+			return err
+		}
+		hardware := &pivsigner.Hardware{Serials: cfg.YubiKeySerials(), Notify: cfg.NotifyCmd, Logger: logger, GnuPGHome: cfg.GnuPGHome}
+		hardware.PrimeGnuPGDiagnostics()
+		if cardLeaseSocket != "" {
+			hardware.Lease = cardlease.Client{Socket: cardLeaseSocket}
+		}
+		signer = hardware
 	}
 	daemonCore := core.New(cfg, signer, version.Value)
 	daemonCore.SetLogger(logger)
@@ -184,6 +194,7 @@ func serve(configPath, controlSocket, wifSocket, forwardSocket, cardLeaseSocket 
 		"wif_socket", wifSocket,
 		"forward_socket", forwardSocket,
 		"card_lease_socket", cardLeaseSocket,
+		"card", cfg.Card,
 		"wif_provider", cfg.Provider().Resource())
 
 	var exitErr error

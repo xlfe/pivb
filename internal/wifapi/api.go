@@ -40,6 +40,7 @@ const (
 	CodeEnv              = tokenapi.CodeEnv
 	CodeInternal         = tokenapi.CodeInternal
 	CodeWindowNotAllowed = tokenapi.CodeWindowNotAllowed
+	CodeCardFree         = tokenapi.CodeCardFree
 )
 
 // SubjectTokenRequest is the fixed request shape. Every field is validated
@@ -129,6 +130,7 @@ func (a *API) writeCoreError(w http.ResponseWriter, r *http.Request, alias strin
 	var windowErr *core.WindowNotAllowedError
 	var policyErr *attachment.PolicyError
 	var pinErr *pivsigner.PINError
+	var cardFreeErr *pivsigner.CardFreeError
 	var upstreamErr *tokenapi.APIError
 	peer := peerAttrs(r.Context())
 	attrs := []any{"alias", alias}
@@ -171,6 +173,15 @@ func (a *API) writeCoreError(w http.ResponseWriter, r *http.Request, alias strin
 		a.logger().Warn("subject-token request asked for a window this provider does not grant",
 			append(attrs, "requested_window_s", windowErr.Requested)...)
 		writeError(w, http.StatusForbidden, err.Error(), CodeWindowNotAllowed, core.WindowNotAllowedRemedy)
+	case errors.As(err, &cardFreeErr):
+		// A routing mistake, not contention: a local-allowed mint reached a
+		// daemon whose card is on another host.
+		a.logger().Warn("subject-token request needs the local card on a card-free origin", attrs...)
+		remedy := cardFreeErr.Remedy
+		if remedy == "" {
+			remedy = pivsigner.CardFreeRemedy
+		}
+		writeError(w, http.StatusForbidden, err.Error(), CodeCardFree, remedy)
 	case errors.As(err, &pinErr):
 		a.logger().Warn("subject-token PIN failure", append(attrs, "error", err)...)
 		remedy := pinErr.Remedy

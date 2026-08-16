@@ -21,6 +21,14 @@ func (e *TouchWindowError) Error() string {
 // MapAPIError is the single hardware-error classifier used by the control,
 // local WIF, and forwarded-provider adapters.
 func MapAPIError(err error) (*tokenapi.APIError, bool) {
+	var cardFree *CardFreeError
+	if errors.As(err, &cardFree) {
+		remedy := cardFree.Remedy
+		if remedy == "" {
+			remedy = CardFreeRemedy
+		}
+		return &tokenapi.APIError{Status: http.StatusForbidden, Code: tokenapi.CodeCardFree, Message: err.Error(), Remedy: remedy}, true
+	}
 	var contention *ContentionError
 	if errors.As(err, &contention) {
 		remedy := "close the competing smart-card client and retry"

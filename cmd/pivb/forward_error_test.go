@@ -17,6 +17,7 @@ import (
 	"github.com/xlfe/pivb/internal/config"
 	"github.com/xlfe/pivb/internal/core"
 	"github.com/xlfe/pivb/internal/forwardapi"
+	"github.com/xlfe/pivb/internal/pivsigner"
 	"github.com/xlfe/pivb/internal/tokenapi"
 )
 
@@ -105,6 +106,47 @@ func TestForwardMintRefusesWindowsTheProviderDoesNotGrant(t *testing.T) {
 	// ordinary mint path and stops where an unlocked daemon would carry on.
 	if _, apiErr := backend.Mint(context.Background(), testForwardMintRequest()); apiErr == nil || apiErr.Code != tokenapi.CodeLocked {
 		t.Fatalf("windowless mint on a provider that grants no windows = %+v", apiErr)
+	}
+}
+
+// A card-free origin keeps serving the two forwarding operations zkad uses on
+// it — policy and invalidation — and answers the two provider-only ones with
+// the card-free code, so a misrouted mint reports "the card is on another
+// host" rather than a hardware fault or a locked daemon.
+func TestForwardBackendOnCardFreeOrigin(t *testing.T) {
+	cfg := &config.Config{
+		PIVSlot: "9c", PINCache: "session", Card: config.CardNone,
+		WIF:  config.WIF{ProjectNumber: "1", PoolID: "pivb", ProviderID: "yubikey", IssuerURI: "https://auth.example.net/pivb/dep1"},
+		Keys: map[string]config.Key{"12345678": {JWKKid: strings.Repeat("k", 43)}},
+		Aliases: map[string]config.Alias{
+			"ro": {Cloud: "gcp", Target: "ro@example.iam.gserviceaccount.com", LifetimeS: 3600},
+		},
+	}
+	backend := forwardBackend{
+		core:   core.New(cfg, pivsigner.CardFree{}, "test"),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	if _, apiErr := backend.Mint(context.Background(), testForwardMintRequest()); apiErr == nil ||
+		apiErr.Status != http.StatusForbidden || apiErr.Code != tokenapi.CodeCardFree {
+		t.Fatalf("card-free mint = %+v, want 403/%s", apiErr, tokenapi.CodeCardFree)
+	}
+	if _, apiErr := backend.Describe(context.Background()); apiErr == nil ||
+		apiErr.Status != http.StatusForbidden || apiErr.Code != tokenapi.CodeCardFree {
+		t.Fatalf("card-free describe = %+v, want 403/%s", apiErr, tokenapi.CodeCardFree)
+	}
+
+	policy, apiErr := backend.Policy(context.Background())
+	if apiErr != nil {
+		t.Fatalf("card-free policy = %+v", apiErr)
+	}
+	if len(policy.EnrolledKeys) != 1 || policy.Aliases["ro"].Target != "ro@example.iam.gserviceaccount.com" {
+		t.Fatalf("card-free policy dropped shared configuration: %#v", policy)
+	}
+	if _, apiErr := backend.Invalidate(context.Background(), forwardapi.InvalidateRequest{
+		Version: forwardapi.ProtocolVersion, WorkspaceID: strings.Repeat("b", 32),
+	}); apiErr != nil {
+		t.Fatalf("card-free invalidation = %+v", apiErr)
 	}
 }
 

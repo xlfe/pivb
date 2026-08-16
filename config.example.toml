@@ -1,6 +1,14 @@
 piv_slot = "9c"
 pin_cache = "session" # or "never": consume the cached PIN on each mint
 notify_cmd = ["notify-send", "pivb"] # [] disables desktop notifications
+# Where this daemon's YubiKey lives. "local", the default, expects pcscd and an
+# enrolled card on this host. "none" declares a card-free ZKA origin: the
+# daemon starts without PC/SC, still routes and verifies workspace-forwarded
+# mints and serves policy/status, and refuses unlock, local mints, and provider
+# describe/mint with PIVB_CARD_FREE. The rest of this file is shared fleet
+# configuration either way — the routed path verifies forwarded assertions
+# against [wif], [keys.*], and the alias tables below.
+card = "local"
 # The longest authorisation window this provider will grant a remote claim,
 # 0..43200, default 0.
 #

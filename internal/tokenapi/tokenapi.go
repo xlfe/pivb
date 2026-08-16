@@ -19,6 +19,9 @@ const (
 	// CodeWindowNotAllowed answers a mint that asked to be covered by an
 	// authorisation window this provider will not grant.
 	CodeWindowNotAllowed = "PIVB_WINDOW_NOT_ALLOWED"
+	// CodeCardFree answers an operation that needs the local YubiKey on a
+	// daemon configured card = "none" — a card-free ZKA origin.
+	CodeCardFree = "PIVB_CARD_FREE"
 )
 
 // SubjectTokenResponse carries the subject token and its Unix expiry. No

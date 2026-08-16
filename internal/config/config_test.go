@@ -312,6 +312,7 @@ func TestLoadRejectsInvalidGlobals(t *testing.T) {
 	runRejections(t, []loadCase{
 		{"piv_slot 9a", setString(t, baseConfig(), "piv_slot", "9a"), []string{`"piv_slot"`, "9a"}},
 		{"pin_cache always", setString(t, baseConfig(), "pin_cache", "always"), []string{`"pin_cache"`, "always"}},
+		{"card remote", withGlobal(`card = "remote"`), []string{`"card"`, `"local"`, `"none"`, "card-free", "remote"}},
 		{
 			"grant window past the ceiling",
 			withGlobal("max_grant_window_s = 43201"),
@@ -323,6 +324,33 @@ func TestLoadRejectsInvalidGlobals(t *testing.T) {
 			[]string{`"max_grant_window_s"`, "got -1"},
 		},
 	})
+}
+
+// TestCardModes pins the card key: absent and "local" are the card host, and
+// only the explicit "none" declares a card-free origin. The rest of the
+// configuration is shared fleet state, so both values load the same schema.
+func TestCardModes(t *testing.T) {
+	cfg, err := loadFrom(t, baseConfig())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Card != CardLocal || cfg.CardFree() {
+		t.Errorf("default card = %q (CardFree %t), want %q", cfg.Card, cfg.CardFree(), CardLocal)
+	}
+	cfg, err = loadFrom(t, withGlobal(`card = "local"`))
+	if err != nil {
+		t.Fatalf("Load explicit local: %v", err)
+	}
+	if cfg.CardFree() {
+		t.Error(`card = "local" reads as card-free`)
+	}
+	cfg, err = loadFrom(t, withGlobal(`card = "none"`))
+	if err != nil {
+		t.Fatalf("Load card-free: %v", err)
+	}
+	if cfg.Card != CardNone || !cfg.CardFree() {
+		t.Errorf("card = %q (CardFree %t), want %q and true", cfg.Card, cfg.CardFree(), CardNone)
+	}
 }
 
 // TestGrantWindowBounds pins both edges of the authorisation window this

@@ -67,11 +67,25 @@ var retiredTopLevelKeys = map[string]struct{}{
 
 var retiredSuffixes = []string{".broker_sa", ".key_id", ".project_id", ".numeric_project_id"}
 
+// The two values of the top-level "card" key. A card-free origin still needs
+// the whole schema — the routed path verifies forwarded assertions against the
+// local [wif], [keys.*], and alias configuration — so the fleet shares one
+// configuration and each host declares only its relationship to the hardware.
+const (
+	CardLocal = "local"
+	CardNone  = "none"
+)
+
 type Config struct {
 	PIVSlot   string   `toml:"piv_slot"`
 	PINCache  string   `toml:"pin_cache"`
 	NotifyCmd []string `toml:"notify_cmd"`
 	GnuPGHome string   `toml:"gnupg_home"`
+	// Card is where this daemon's YubiKey lives: "local" (the default) expects
+	// pcscd and an enrolled card on this host; "none" declares a card-free ZKA
+	// origin that starts without PC/SC and refuses every operation that would
+	// need the card.
+	Card string `toml:"card"`
 	// MaxGrantWindowS is the longest authorisation window this provider will
 	// grant a ZKA workspace claim. Zero, the default, refuses every claim that
 	// asks to be covered by one. It is provider-level rather than per-alias:
@@ -205,6 +219,9 @@ func (c *Config) applyDefaults() {
 	if c.PINCache == "" {
 		c.PINCache = "session"
 	}
+	if c.Card == "" {
+		c.Card = CardLocal
+	}
 	if c.NotifyCmd == nil {
 		c.NotifyCmd = []string{"notify-send", "pivb"}
 	}
@@ -233,6 +250,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PINCache != "session" && c.PINCache != "never" {
 		fail("config key \"pin_cache\" must be \"session\" or \"never\", got %q", c.PINCache)
+	}
+	if c.Card != CardLocal && c.Card != CardNone {
+		fail("config key \"card\" must be %q or %q (\"none\" declares a card-free ZKA origin), got %q", CardLocal, CardNone, c.Card)
 	}
 	if c.GnuPGHome != "" && !filepath.IsAbs(c.GnuPGHome) {
 		fail("config key \"gnupg_home\" must be an absolute path when set, got %q", c.GnuPGHome)
@@ -365,6 +385,10 @@ func validateIssuerURI(raw string) error {
 	}
 	return nil
 }
+
+// CardFree reports whether this daemon is configured card = "none": a ZKA
+// origin that opens no smart-card connection and refuses card operations.
+func (c *Config) CardFree() bool { return c.Card == CardNone }
 
 // Provider returns the WIF provider identity for audience derivation.
 func (c *Config) Provider() wif.Provider {

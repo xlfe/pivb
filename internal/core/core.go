@@ -230,19 +230,22 @@ type MintCounters struct {
 }
 
 type Status struct {
-	PINCached         bool                       `json:"pin_cached"`
-	PINVerifiedSerial uint32                     `json:"pin_verified_serial"`
-	WIFProvider       string                     `json:"wif_provider"`
-	LastSignAlias     string                     `json:"last_sign_alias,omitempty"`
-	LastSignTarget    string                     `json:"last_sign_target,omitempty"`
-	LastSignSerial    uint32                     `json:"last_sign_serial,omitempty"`
-	LastSignKeyID     string                     `json:"last_sign_key_id,omitempty"`
-	LastSignAt        time.Time                  `json:"last_sign_at,omitzero"`
-	LastSignRoute     string                     `json:"last_sign_route,omitempty"`
-	LastSignForward   *forwardapi.ForwardContext `json:"last_sign_forward_context,omitempty"`
-	Mints             *MintCounters              `json:"mints,omitempty"`
-	ReuseWindows      []ReuseWindow              `json:"reuse_windows,omitempty"`
-	Version           string                     `json:"version"`
+	PINCached         bool   `json:"pin_cached"`
+	PINVerifiedSerial uint32 `json:"pin_verified_serial"`
+	// Card is the daemon's configured relationship to PIV hardware, "local" or
+	// "none", so a headless origin explains its refusals in its own status.
+	Card            string                     `json:"card"`
+	WIFProvider     string                     `json:"wif_provider"`
+	LastSignAlias   string                     `json:"last_sign_alias,omitempty"`
+	LastSignTarget  string                     `json:"last_sign_target,omitempty"`
+	LastSignSerial  uint32                     `json:"last_sign_serial,omitempty"`
+	LastSignKeyID   string                     `json:"last_sign_key_id,omitempty"`
+	LastSignAt      time.Time                  `json:"last_sign_at,omitzero"`
+	LastSignRoute   string                     `json:"last_sign_route,omitempty"`
+	LastSignForward *forwardapi.ForwardContext `json:"last_sign_forward_context,omitempty"`
+	Mints           *MintCounters              `json:"mints,omitempty"`
+	ReuseWindows    []ReuseWindow              `json:"reuse_windows,omitempty"`
+	Version         string                     `json:"version"`
 }
 
 type Core struct {
@@ -332,6 +335,10 @@ func (c *Core) Unlock(ctx context.Context, pin string) (int, error) {
 	if pin == "" {
 		return -1, errors.New("PIN must not be empty")
 	}
+	if c.cfg.CardFree() {
+		return -1, &pivsigner.CardFreeError{Operation: "verify a PIV PIN",
+			Remedy: "run `pivb unlock` on the provider host that holds the YubiKey; a card-free origin caches no PIN"}
+	}
 	c.mintMu.Lock()
 	defer c.mintMu.Unlock()
 	serial, retries, err := c.signer.VerifyPIN(ctx, pin)
@@ -391,6 +398,13 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 	}
 	if req.RouteSocket != "" {
 		return SubjectTokenResult{}, &attachment.PolicyError{Message: "local-allowed request cannot select a workspace route"}
+	}
+	// Refused from configuration alone, before any cached state is consulted:
+	// a card-free origin must answer "the card is elsewhere", never the
+	// PIVB_LOCKED that unlock here can never satisfy.
+	if c.cfg.CardFree() {
+		return SubjectTokenResult{}, &pivsigner.CardFreeError{Operation: "mint a locally signed subject token",
+			Remedy: "run the workload in a ZKA route-required workspace, or configure card = \"local\" on the host that holds the YubiKey"}
 	}
 	source, _, err := agentsource.Validate(req.RequestSource, req.Alias)
 	if err != nil {
@@ -538,6 +552,10 @@ func (c *Core) SubjectToken(ctx context.Context, req SubjectTokenRequest) (Subje
 // identity used to prepare a ZKA credential claim. It never verifies a PIN or
 // requests a touch.
 func (c *Core) DescribeForwardProvider(ctx context.Context) (forwardapi.Description, error) {
+	if c.cfg.CardFree() {
+		return forwardapi.Description{}, &pivsigner.CardFreeError{Operation: "describe a live provider card",
+			Remedy: "create PIVB credential bundles on the provider host that holds the YubiKey"}
+	}
 	describer, ok := c.signer.(pivsigner.Describer)
 	if !ok {
 		return forwardapi.Description{}, errors.New("configured signer cannot describe its live card")
@@ -743,6 +761,7 @@ func (c *Core) Status() Status {
 	status := Status{
 		PINCached:         len(c.pin) != 0,
 		PINVerifiedSerial: c.pinVerifiedSerial,
+		Card:              cardMode(c.cfg),
 		WIFProvider:       c.cfg.Provider().Resource(),
 		Version:           c.version,
 	}
@@ -860,6 +879,16 @@ func (c *Core) loggerLocked() *slog.Logger {
 		return c.logger
 	}
 	return slog.Default()
+}
+
+// cardMode is the daemon's effective card configuration. config's defaulting
+// pass fills the field in, so an empty value reaches here only from a
+// hand-built configuration and reads as the default.
+func cardMode(cfg *config.Config) string {
+	if cfg.Card == "" {
+		return config.CardLocal
+	}
+	return cfg.Card
 }
 
 // aliasAssertionLifetime is how long one assertion minted for this alias stays
